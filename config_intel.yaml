@@ -1,0 +1,36 @@
+server:
+  host: "0.0.0.0"
+  port: 8000
+  # IPv4 (0.0.0.0) uses ai.sunflv.top cert; IPv6 (::) uses 6.sunflv.top cert
+  # Both on port 8000 — separate sockets per address family
+  listeners:
+    - host: "0.0.0.0"
+      port: 8000
+      ssl_cert: "route/to/your/domain.crt"
+      ssl_key:  "route/to/your/domain.key"
+    - host: "::"
+      port: 8000
+      ssl_cert: "route/to/your/domain.crt"
+      ssl_key:  "route/to/your/domain.key"
+
+backend: "http://127.0.0.1:9880"
+backend_base_port: 9880
+pool_size: 2
+intel_root: "route/to/your/GPT-SoVITS-Instance"
+
+tts:
+  device: "your_device"
+  is_half: true
+  version: v4
+  t2s_weights_path: "GPT_SoVITS/pretrained_models/s1v3.ckpt"
+  vits_weights_path: "GPT_SoVITS/pretrained_models/gsv-v4-pretrained/s2Gv4.pth"
+  bert_base_path: "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large"
+  cnhuhbert_base_path: "GPT_SoVITS/pretrained_models/chinese-hubert-base"
+
+voices:
+  - name: "default"
+    description: "defult"
+    text_lang: "zh"
+    prompt_lang: "zh"
+    ref_audio_path: "route/to/your/ref.wav/or/mp3"
+    prompt_text: "xxx"
