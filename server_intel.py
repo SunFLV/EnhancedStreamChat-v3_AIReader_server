@@ -69,11 +69,20 @@ def start_backend_instance(port):
     logger.info("Backend %s starting (PID %s)", port, proc.pid)
 
 def start_backend_pool():
-    """Start all backend instances in the pool."""
+    """Start all backend instances in the pool.
+    SERIAL: each instance fully loads (model) before the next starts.
+    This keeps memory usage near one instance's footprint instead of N×."""
     for i in range(POOL_SIZE):
         port = BACKEND_BASE_PORT + i
-        if not _port_in_use(port):
-            start_backend_instance(port)
+        if _port_in_use(port):
+            continue
+        start_backend_instance(port)
+        # Wait for this instance to be ready before starting the next one,
+        # so only one model is resident in RAM at a time.
+        if backend_ready(port):
+            logger.info("Backend %s loaded.", port)
+        else:
+            logger.warning("Backend %s did not become ready.", port)
 
 def restart_backend(port):
     """Kill and restart one backend instance."""
@@ -91,18 +100,26 @@ def restart_backend(port):
 
 def _monitor_backends():
     """Daemon: periodically check each backend is alive, restart if dead.
-    Fixes the case where a backend gets killed (OOM/external) and never
-    comes back because the proxy only checks ports at startup."""
+    Uses PROCESS state (not port) to avoid killing backends that are still
+    loading models (api_v2 binds the port only AFTER model load, ~90s)."""
     import time as _t
     while True:
         _t.sleep(15)
         for i in range(POOL_SIZE):
             port = BACKEND_BASE_PORT + i
+            proc = _backend_procs.get(port)
+            # Not started yet (serial startup hasn't reached it) → skip.
+            # monitor must NOT auto-start it, or it would break serial loading.
+            if proc is None:
+                continue
+            # Process still alive (loading or serving) → leave it alone.
+            if proc.poll() is None:
+                continue
+            # Process exited → restart if the port is free.
             if not _port_in_use(port):
-                logger.warning("Backend %s is DEAD — restarting", port)
+                logger.warning("Backend %s process DEAD — restarting", port)
                 try:
-                    if not _port_in_use(port):
-                        start_backend_instance(port)
+                    start_backend_instance(port)
                 except Exception as e:
                     logger.error("Failed to restart backend %s: %s", port, e)
 
@@ -159,6 +176,43 @@ def _speaker_cache_path(speaker, voice, speed):
     h = hashlib.md5(key.encode("utf-8")).hexdigest()[:16]
     # Voice + speed are safe-ish; speaker goes into hash
     return SPEAKER_CACHE_DIR / f"{voice}_{speed}_{h}.wav"
+
+
+def _trim_silence(wav_bytes, threshold=0.005, window_ms=100, pad_ms=50):
+    """Trim leading/trailing silence from a WAV using windowed RMS.
+    GPT-SoVITS's vocoder adds ~0.5s of silence padding at the start (and a bit
+    at the end), which makes the first/last words sound swallowed. Cut it off
+    while keeping a small pad so speech isn't clipped."""
+    try:
+        import io as _io
+        import numpy as _np
+        data, sr = sf.read(_io.BytesIO(wav_bytes), dtype="float32")
+        if data.ndim > 1:
+            data = data.mean(axis=1)
+        n = len(data)
+        win = max(1, int(sr * window_ms / 1000.0))
+        n_windows = n // win
+        if n_windows < 2:
+            return wav_bytes
+        # Windowed RMS (vectorized)
+        seg = data[: n_windows * win].reshape(n_windows, win)
+        rms = _np.sqrt((seg ** 2).mean(axis=1))
+        above = _np.where(rms > threshold)[0]
+        if len(above) == 0:
+            return wav_bytes  # all silent — keep unchanged
+        pad = int(sr * pad_ms / 1000.0)
+        start = max(0, int(above[0]) * win - pad)
+        end = min(n, int(above[-1] + 1) * win + pad)
+        if end <= start:
+            return wav_bytes
+        trimmed = data[start:end]
+        out = _io.BytesIO()
+        sf.write(out, trimmed, sr, format="WAV", subtype="PCM_16")
+        out.seek(0)
+        return out.getvalue()
+    except Exception as e:
+        logger.warning("Trim silence failed: %s", e)
+        return wav_bytes
 
 
 def _concat_wav(*wav_bytes_list):
@@ -323,15 +377,45 @@ def _cleanup_tasks():
                 del _tts_tasks[k]
 
 
+def _speakable_len(s):
+    """Length of a sentence ignoring leading/trailing punctuation — the
+    amount that actually reaches the phoneme extractor."""
+    return len(s.strip('。！？!?；;,.…～~、 \t　"“”‘’'))
+
+
 def _split_sentences(text):
-    """Split long text into speakable sentences."""
+    """Split long text into speakable sentences.
+    - Normalizes CRLF/CR to LF (Windows pastes)
+    - Splits on sentence terminators AND newlines (paragraph breaks)
+    - Merges isolated short fragments (closing quotes like 」”）) back
+      into the previous sentence, so `“xxx。”` isn't torn apart into
+      `“xxx。` + `”` (the bare quote would be cleaned to empty & skipped).
+    - Merges ultra-short sentences (≤ 6 speakable chars) into the previous
+      sentence: GPT-SoVITS's T2S decodes immediate-EOS → near-silent audio
+      for very short texts, so they must never reach the backend alone.
+    """
     import re
-    # Split on Chinese/English sentence terminators, keep them attached
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+
+    # Split keeping the terminator attached to its sentence
     parts = re.split(r'(?<=[。！？!?；;\n])', text)
     sents = [p.strip() for p in parts if p.strip()]
+
+    # Merge trailing closers and ultra-short sentences into the previous one
+    merged = []
+    for s in sents:
+        if not merged:
+            merged.append(s)
+        elif len(s) <= 1 and s in '”’」』）】…':
+            merged[-1] += s
+        elif _speakable_len(s) <= 6:
+            merged[-1] += s
+        else:
+            merged.append(s)
+
     # Further split any sentence over 200 chars
     result = []
-    for s in sents:
+    for s in merged:
         while len(s) > 200:
             cut = s[:200].rfind('，')
             if cut < 50:
@@ -341,6 +425,110 @@ def _split_sentences(text):
         if s:
             result.append(s)
     return result
+
+
+# Common danmaku emoji → Chinese word, so they're read aloud instead of dropped.
+EMOJI_MAP = {
+    "🎉": "撒花", "🎊": "庆祝", "🎆": "庆祝", "🎇": "庆祝",
+    "😀": "开心", "😄": "开心", "😁": "开心", "😆": "开心",
+    "😂": "笑哭", "🤣": "笑哭", "😅": "尴尬", "😊": "微笑",
+    "😍": "喜欢", "🥰": "喜欢", "😘": "飞吻", "😎": "得意",
+    "👍": "点赞", "👎": "踩", "👏": "鼓掌", "🙏": "拜托",
+    "🔥": "好棒", "💀": "无语", "😭": "大哭", "😢": "难过",
+    "😡": "生气", "🤬": "愤怒", "😱": "惊吓", "🤯": "震惊",
+    "🤔": "思考", "😳": "害羞", "😴": "睡觉", "😋": "好吃",
+    "🥺": "可怜", "😇": "天使", "😈": "恶魔", "🤗": "拥抱",
+    "🤪": "搞怪", "🤑": "发财", "🤩": "惊喜", "🥳": "庆祝",
+    "❤": "爱心", "💕": "爱心", "💯": "满分", "✨": "闪亮",
+    "🌟": "星星", "⭐": "星星", "🍀": "好运", "👌": "可以",
+    "✌": "胜利", "🤝": "握手", "👋": "再见", "🫡": "敬礼",
+    "🤤": "流口水", "🥵": "热", "🥶": "冷", "😤": "不服",
+    "😮‍💨": "叹气", "🫠": "融化", "🫶": "比心",
+}
+
+import re
+
+# Longest-first alternation so multi-codepoint entries (e.g. 😮‍💨) match
+# whole instead of their parts.
+_CURATED_EMOJI_RE = re.compile(
+    "|".join(map(re.escape, sorted(EMOJI_MAP, key=len, reverse=True))))
+
+try:
+    import emoji as _emoji_mod
+except Exception:
+    _emoji_mod = None
+
+
+def _emoji_to_cn(text):
+    """Convert emojis to spoken Chinese so GPT-SoVITS reads them aloud.
+
+    Layer 1: curated danmaku words (EMOJI_MAP) — 👍🏻 → 点赞, 🔥 → 好棒.
+    Layer 2: the `emoji` package's Unicode CLDR Simplified-Chinese short
+    names for everything else — 🇨🇳 → 中国, 👨‍👩‍👧 → 家庭男人女人女孩.
+    Falls back to layer 1 alone if the package is missing.
+    """
+    # Strip invisible chars that would fragment multi-codepoint emoji:
+    # variation selectors (FE00–FE0F, incl. emoji presentation), ZWSP, ZWNJ,
+    # LRM/RLM, word joiner, BOM. NOT ZWJ (U+200D) — demojize needs it to
+    # join family/couple sequences whole.
+    text = re.sub(r'[﻿︀-️​‌‎‏⁠]', '', text)
+    # Skin-tone modifiers strip out, so 👍🏻 falls back to base 👍 — reads as
+    # "点赞" instead of "点赞_较浅肤色" mid-sentence.
+    text = re.sub(r'[\U0001f3fb-\U0001f3ff]', '', text)
+    # Layer 1: curated danmaku words (one longest-first pass)
+    text = _CURATED_EMOJI_RE.sub(lambda m: EMOJI_MAP[m.group(0)], text)
+    # Layer 2: CLDR zh short names for whatever remains
+    if _emoji_mod is not None:
+        try:
+            text = _emoji_mod.demojize(text, language='zh')
+            text = text.replace(':', '').replace('_', '')
+        except Exception:
+            pass  # keep layer-1 result
+    return text
+
+
+def _clean_text(text):
+    """Convert emojis to Chinese words, then KEEP ONLY characters that
+    GPT-SoVITS can synthesize (CJK, kana, hangul, ASCII, full-width punct).
+    Anything else is dropped — this prevents GBK codec errors like
+    \"'gbk' codec can't encode character '\\u23ae'\" on the Windows backend."""
+    import re
+    if not text:
+        return ""
+    # Emojis → spoken Chinese (curated danmaku words, then CLDR zh short names)
+    text = _emoji_to_cn(text)
+
+    def _keep(ch):
+        o = ord(ch)
+        if ch == ' ':
+            return True
+        if 0x20 <= o <= 0x7E:      # ASCII printable (letters/digits/punct)
+            return True
+        if 0x3000 <= o <= 0x303F:  # CJK punctuation 。、，？！ etc
+            return True
+        if 0x3040 <= o <= 0x30FF:  # hiragana + katakana
+            return True
+        if 0x31F0 <= o <= 0x31FF:  # katakana phonetic extensions
+            return True
+        if 0x3400 <= o <= 0x9FFF:  # CJK unified ideographs
+            return True
+        if 0xF900 <= o <= 0xFAFF:  # CJK compatibility ideographs
+            return True
+        if 0xAC00 <= o <= 0xD7AF:  # hangul
+            return True
+        if 0xFF00 <= o <= 0xFFEF:  # full-width forms（，。！？ etc）
+            return True
+        return False
+
+    text = ''.join(c for c in text if _keep(c))
+    # A sentence that cleans down to only punctuation — e.g. an emoji tag
+    # line "🖤💙🔁❌！" → "！" — has nothing speakable. Return empty so the
+    # caller skips it instead of sending a bare "！" to the backend
+    # (which can't synthesize it and just yields silence).
+    if not any(c.isalnum() for c in text):
+        return ""
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
 
 def _new_task(text, voice, speed):
@@ -365,6 +553,12 @@ def _run_long_task(task_id, text, voice, speed):
     Supports crash recovery — each completed sentence is persisted to disk
     (fragment WAV + progress), so a restart resumes from the last sentence."""
     try:
+        # Wait until at least one backend is listening — resume threads can
+        # be started before a backend finished model loading.
+        for _ in range(120):  # up to 4 min
+            if any(_port_in_use(BACKEND_BASE_PORT + i) for i in range(POOL_SIZE)):
+                break
+            time.sleep(2)
         sents = _split_sentences(text)
         total = len(sents)
         with _tts_tasks_lock:
@@ -384,10 +578,17 @@ def _run_long_task(task_id, text, voice, speed):
 
         MAX_RETRIES = 3
         for i in range(start, total):
+            # Clean unsupported chars — keep sentence body, drop emojis/etc
+            cleaned = _clean_text(sents[i])
+            if not cleaned:
+                logger.warning("Long-text: sentence %d empty after cleanup — skipping", i + 1)
+                with _tts_tasks_lock:
+                    _tts_tasks[task_id]["done"] = i + 1
+                continue
             ok = False
             for attempt in range(MAX_RETRIES):
                 try:
-                    wav = _synthesize(sents[i], voice, speed)
+                    wav = _synthesize(cleaned, voice, speed)
                     chunks.append(wav)
                     # Persist this sentence's audio immediately (crash-proof)
                     (TASK_CACHE_DIR / f"{task_id}.{i}.wav").write_bytes(wav)
@@ -407,7 +608,7 @@ def _run_long_task(task_id, text, voice, speed):
         with _tts_tasks_lock:
             task = _tts_tasks[task_id]
             if merged:
-                task["wav"] = merged.getvalue()
+                task["wav"] = _trim_silence(merged.getvalue())  # cut head/tail padding
             task["status"] = "done" if merged else "error"
             if not merged:
                 task["error"] = "No sentences synthesized"
@@ -616,8 +817,11 @@ async function pollTask(taskId) {
     if (p.status === 'done') {
       showProgress(100, '✅ 长文合成完成');
       audio.src = `/api/tts/result/${taskId}?key=${taskKey}`;
+      audio.volume = 1.0;
       player.style.display = 'block';
-      audio.play();
+      audio.play().catch(() => {
+        status.textContent = '⚠️ 长文完成，自动播放被阻止，请点击播放器手动播放';
+      });
       longBtn.disabled = false; go.disabled = false;
       return;
     }
@@ -655,9 +859,14 @@ $('go').onclick = async () => {
     const blob = await r.blob();
     const url = URL.createObjectURL(blob);
     audio.src = url;
+    audio.volume = 1.0;  // ensure not muted
     player.style.display = 'block';
     status.textContent = '✅ 合成完成（' + (r.headers.get('X-TTS-Time') || '?') + 's）';
-    audio.play();
+    try {
+      await audio.play();
+    } catch(e) {
+      status.textContent = '⚠️ 合成完成，但自动播放被阻止，请点击播放器手动播放';
+    }
   } catch(e) {
     status.textContent = '❌ ' + e;
   } finally {
@@ -770,49 +979,98 @@ def _candidate_ports(voice):
     return [affinity] + others
 
 
+def _is_silent_wav(wav_bytes, threshold=0.001):
+    """Return True if a WAV's audio contains no audible speech.
+
+    GPT-SoVITS returns HTTP 200 with a 1s 16kHz all-zero WAV when its
+    internal inference crashes (e.g. bad allocation on XPU) — the bytes
+    look like a success but are pure silence. Detecting it here means
+    the retry/failover path runs instead of persisting silent audio.
+    """
+    try:
+        data, sr = sf.read(io.BytesIO(wav_bytes), dtype="float32")
+    except Exception:
+        return True  # unparseable → treat as bad
+    if data.size == 0:
+        return True
+    rms = float((data ** 2).mean() ** 0.5)
+    return rms <= threshold
+
+
+def _pad_short_text(text):
+    """If a cleaned text has ≤ 2 speakable characters, duplicate its core once
+    so the utterance is long enough for GPT-SoVITS to synthesize
+    (e.g. "咔嗒。" → "咔嗒咔嗒。"). Only used as a fallback after a silent
+    result — text that already synthesizes is never altered."""
+    core = text.rstrip('。！？!?；;,.…～~、 \t　"“”‘’')
+    if len(core) >= 3 or not core:
+        return text
+    return core * 2 + text[len(core):]
+
+
 def _synthesize(text, voice, speed):
-    """Synthesize one text chunk via backend, with OOM failover.
-    Tries voice-affinity backend first; on OOM/unreachable, falls back
-    to the next healthy instance while restarting the failed one in background."""
-    v = VOICES.get(voice, VOICES["default"])
-    payload = {
-        "text": text,
-        "text_lang": v.get("text_lang", "zh"),
-        "ref_audio_path": v.get("ref_audio_path", ""),
-        "prompt_text": v.get("prompt_text", ""),
-        "prompt_lang": v.get("prompt_lang", "zh"),
-        "speed_factor": speed,
-        "text_split_method": "cut5",
-        "top_k": 5,
-        "top_p": 1.0,
-        "temperature": 1.0,
-        "seed": -1,
-        "batch_size": 1,
-        "parallel_infer": True,
-        "repetition_penalty": 1.35,
-        "streaming_mode": False,
-    }
+    """Synthesize one text chunk via backend, with OOM/silence failover.
+    Tries voice-affinity backend first; on OOM/unreachable/silent output,
+    falls back to the next healthy instance (restarting a failed one in
+    background on OOM).
 
-    # Serialize globally: one inference at a time.
-    # If the active instance OOMs, fall through to the hot standby.
-    with _tts_lock:
-        for port in _candidate_ports(voice):
-            backend_url = f"http://127.0.0.1:{port}"
-            try:
-                r = requests.post(f"{backend_url}/tts", json=payload, timeout=300)
-            except requests.exceptions.ConnectionError:
-                logger.warning("Backend %s unreachable — failover to next", port)
-                continue
-            if r.status_code == 200:
-                return r.content
-            err = r.text
-            if "OUT_OF_DEVICE_MEMORY" in err or "OUT_OF_RESOURCES" in err:
-                logger.warning("Backend %s GPU OOM — failover to standby, restarting in background", port)
-                threading.Thread(target=restart_backend, args=(port,), daemon=True).start()
-                continue
-            raise HTTPException(502, f"Backend error {r.status_code}: {err[:200]}")
+    Ultra-short texts (e.g. "咔嗒。") make GPT-SoVITS T2S decode immediate-EOS
+    → near-silence on every backend. As a last resort, if all backends return
+    silence for a short text, it is padded once and retried."""
+    def _attempt(t):
+        v = VOICES.get(voice, VOICES["default"])
+        payload = {
+            "text": t,
+            "text_lang": v.get("text_lang", "zh"),
+            "ref_audio_path": v.get("ref_audio_path", ""),
+            "prompt_text": v.get("prompt_text", ""),
+            "prompt_lang": v.get("prompt_lang", "zh"),
+            "speed_factor": speed,
+            "text_split_method": "cut2",  # 凑50字一段 — 避免 cut5 把首尾短片段吞掉
+            "top_k": 5,
+            "top_p": 1.0,
+            "temperature": 1.0,
+            "seed": -1,
+            "batch_size": 1,
+            # 关掉并行推理 — XPU 上并行批推理易触发显存分配失败(bad allocation)→静音
+            "parallel_infer": False,
+            "repetition_penalty": 1.35,
+            "streaming_mode": False,
+        }
+        # Serialize globally: one inference at a time.
+        # If the active instance OOMs, fall through to the hot standby.
+        with _tts_lock:
+            for port in _candidate_ports(voice):
+                backend_url = f"http://127.0.0.1:{port}"
+                try:
+                    r = requests.post(f"{backend_url}/tts", json=payload, timeout=300)
+                except requests.exceptions.ConnectionError:
+                    logger.warning("Backend %s unreachable — failover to next", port)
+                    continue
+                if r.status_code == 200:
+                    if _is_silent_wav(r.content):
+                        logger.warning("Backend %s returned SILENT audio for %r — failover to next",
+                                       port, t[:20])
+                        continue
+                    return r.content
+                err = r.text
+                if "OUT_OF_DEVICE_MEMORY" in err or "OUT_OF_RESOURCES" in err:
+                    logger.warning("Backend %s GPU OOM — failover to standby, restarting in background", port)
+                    threading.Thread(target=restart_backend, args=(port,), daemon=True).start()
+                    continue
+                raise HTTPException(502, f"Backend error {r.status_code}: {err[:200]}")
+        return None
 
-    raise HTTPException(503, "All backends unavailable. Please retry.")
+    result = _attempt(text)
+    if result is None:
+        padded = _pad_short_text(text)
+        if padded != text:
+            logger.warning("All backends silent for short text %r — retrying padded as %r",
+                           text[:20], padded[:20])
+            result = _attempt(padded)
+    if result is None:
+        raise HTTPException(503, "All backends unavailable. Please retry.")
+    return result
 
 
 @app.post("/api/tts")
@@ -822,6 +1080,9 @@ def tts(req: TTSRequest):
     # async def would serialize all requests on the event loop.
     voice = req.voice
     t0 = time.time()
+    clean_text = _clean_text(req.text)  # drop unsupported chars (emojis etc)
+    if not clean_text:
+        raise HTTPException(400, "文本清洗后为空（仅含 emoji/特殊符号）")
 
     try:
         # Speaker audio (cached) — "名字说" is highly repeatable
@@ -834,10 +1095,12 @@ def tts(req: TTSRequest):
                 _cache_speaker(req.speaker, voice, req.speed, speaker_wav)
 
         # Text audio (always generated, with failover handled inside)
-        text_wav = _synthesize(req.text, voice, req.speed)
+        text_wav = _synthesize(clean_text, voice, req.speed)
+        text_wav = _trim_silence(text_wav)  # cut vocoder head/tail padding
 
         # Merge: speaker + text
         if speaker_wav:
+            speaker_wav = _trim_silence(speaker_wav)
             merged, sr = _concat_wav(speaker_wav, text_wav)
             elapsed = time.time() - t0
             logger.info(f"TTS: voice={voice} speaker={req.speaker} len={len(req.text)} {elapsed:.1f}s")
@@ -910,14 +1173,13 @@ if __name__ == "__main__":
     host = sc.get("host", "0.0.0.0")
     listeners = sc.get("listeners", [{"port": sc.get("port", 8000)}])
 
-    # Load long-text tasks from disk (survive proxy restart)
-    _load_tasks_from_disk()
-
     # Daemons: task cleanup + backend keep-alive
     threading.Thread(target=_cleanup_tasks, daemon=True).start()
     threading.Thread(target=_monitor_backends, daemon=True).start()
 
-    # Start backend pool
+    # Start backend pool FIRST, and wait for each instance to become ready.
+    # Silence is no longer probed at startup — every inference result is
+    # checked in _synthesize and fails over to another backend on silence.
     logger.info("Starting %s backend instance(s)...", POOL_SIZE)
     start_backend_pool()
     for i in range(POOL_SIZE):
@@ -926,6 +1188,10 @@ if __name__ == "__main__":
             logger.info("Backend %s ready.", port)
         else:
             logger.warning("Backend %s not ready yet.", port)
+
+    # Resume long-text tasks from disk — only AFTER backends are ready,
+    # so resume threads don't hit "backend not initialized" errors.
+    _load_tasks_from_disk()
 
     def serve(lst):
         """Serve one listener. host '::' = IPv6, '0.0.0.0' = IPv4."""
