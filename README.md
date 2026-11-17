@@ -122,25 +122,31 @@ starts[k] = sum(durations[:k])
 
 ---
 
-## 🧠 模型版本选择（v4 / v5Turbo）
+## 🧠 模型与并发池（v5Turbo 4 路）
 
-`config_intel.yaml` 的 `models:` 定义可选版本，每个版本会生成一份独立的
-`model_configs/<版本>.yaml`，后端进程用 `api_v2.py -c <该文件>` 启动，
-因此选择哪个版本就加载哪套 SoVITS/GPT，不会串模型。
+`config_intel.yaml` 只定义一个模型 profile：`v5turbo`。所有音色（包括名字里带
+`v4_` 的）都统一走 v5Turbo 底模 —— 前端即使传旧版本名 `v4` 也会被归一化到
+这个唯一 profile，服务端不再加载任何 v4 模型。
 
-- `default_model`：未显式指定时的默认版本，当前为 `v5turbo`
-- `ports_per_model`：每个版本占用的后端进程槽位（默认 2，端口从 `backend_base_port` 起顺延）
-- `sample_steps`：v5Turbo 默认 8，v4 默认 32
+- `ports_per_model: 4` → 4 个 `api_v2` 后端常驻在 `9880-9883`
+- 每个后端独占服务一个请求，通过端口租约池实现**最多 4 路真正并行**；
+  同一端口不会被并发 POST，第 5 个请求会等待空闲实例
+- `pool_idle_ttl: 0` → 实例加载完成后常驻，不因空闲卸载（保证 4 路随时可用）
+- 冷启动仍按需触发、且加载过程全局串行，避免 4 个进程同时加载造成显存峰值
+- 显存预算：单份约 2.2 GiB，4 份约 8.8 GiB，加推理激活约 12-13 GiB；
+  A770 为 15.56 GiB，**不要再增加并发数**
+- `parallel_infer: true` + `batch_size: 2`：单实例内并行批推理，长文本实测
+  快约 16%（48 s → 41 s）；若某次返回静音，服务端会自动回退到串行重试
 
-接口新增可选字段 `version`：
+接口仍保留可选字段 `version`（为兼容旧前端），但只有 `v5turbo` 一个有效值：
 
 ```json
 // POST /api/tts 或 /api/tts/long
 { "text": "...", "voice": "v4_sunflv", "version": "v5turbo", "speed": 1.0 }
 ```
 
-网页合成页也有「模型版本」下拉框；任务会记录所用版本，恢复/导入时沿用。
-`GET /api/voices` 会返回 `versions` 与 `default_version`。
+`GET /api/voices` 的 `versions` 现在只返回 v5Turbo，`GET /api/health` 的 `pool`
+会列出 4 个端口的实时状态（cold/warming/hot）。
 
 ## 🔌 对接的 API
 

@@ -65,7 +65,7 @@ if not MODEL_PROFILES:
             "label": DEFAULT_MODEL,
             "t2s_weights_path": TTS_BASE_CFG.get("t2s_weights_path"),
             "vits_weights_path": TTS_BASE_CFG.get("vits_weights_path"),
-            "sample_steps": 8 if "v5" in str(TTS_BASE_CFG.get("version", "")) else 32,
+            "sample_steps": 4 if "v5" in str(TTS_BASE_CFG.get("version", "")) else 32,
             "is_half": TTS_BASE_CFG.get("is_half", True),
         }
     }
@@ -81,6 +81,26 @@ PORT_MODEL = {port: key for key, base in MODEL_PORT_BASE.items()
               for port in range(base, base + PORTS_PER_MODEL)}
 ALL_BACKEND_PORTS = sorted(PORT_MODEL)
 _backend_model = {}    # port -> model_key actually loaded
+
+# Port-lease pool: one lease per backend instance, caps concurrency at the
+# pool size and guarantees a port is never POSTed concurrently.
+import queue as _queue
+_port_leases = _queue.Queue()
+for _p in ALL_BACKEND_PORTS:
+    _port_leases.put(_p)
+
+
+def _acquire_port(voice=None, model_key=None):
+    """Take a free backend port (blocks until one is available).
+
+    All ports run the identical v5Turbo model, so any free port serves any
+    voice — 4 concurrent requests for the SAME voice still spread across all
+    4 instances. The lease is held until _release_port() after synthesis."""
+    return _port_leases.get()
+
+
+def _release_port(port):
+    _port_leases.put(port)
 
 
 def _resolve_model_key(model_key=None):
@@ -302,26 +322,20 @@ def _ensure_backend_hot(port, model_key=None):
                 and _backend_model.get(port) in (None, key)):
             _touch(port)
             return True
+    # Single-model pool: no peer eviction. All 4 ports hold the same v5Turbo
+    # model and must stay resident for 4-way concurrency. Loads stay serialized
+    # under _warm_lock so 4 cold starts never spike XPU memory at once.
     with _warm_lock:
         with _pool_lock:
             if (_backend_state.get(port) == "hot" and _port_in_use(port)
                     and _backend_model.get(port) in (None, key)):
                 _touch(port)
                 return True
-            # Which hot peers can be released before this cold one loads?
-            evict = [pp for pp in ALL_BACKEND_PORTS
-                     if pp != port
-                     and _backend_state.get(pp) == "hot"
-                     and time.time() - _backend_last_use.get(pp, 0)
-                     > POOL_EVICT_GRACE]
             proc = _backend_procs.get(port)
             need_start = (not _port_in_use(port)
                           and (proc is None or proc.poll() is not None))
             if not need_start:
                 _backend_state[port] = "warming"  # a proc is up, model still loading
-        # Outside the pool lock (the helpers lock themselves).
-        for pp in evict:
-            _evict_if_idle(pp, POOL_EVICT_GRACE)
         if need_start:
             start_backend_instance(port, key)
         ok = backend_ready(port)
@@ -338,9 +352,9 @@ def _ensure_backend_hot(port, model_key=None):
 
 
 def _monitor_backends():
-    """Daemon: idle hot backends are unloaded (memory saver); hot backends that
-    died are marked cold (they reload lazily on next use). Cold/warming
-    backends are never force-started here — loading is demand-driven."""
+    """Daemon: keep dead backends marked cold for lazy reload. Idle eviction
+    only happens if POOL_IDLE_TTL > 0; the v5-only 4-way pool sets it to 0 so
+    all 4 instances stay resident for concurrency."""
     while True:
         time.sleep(15)
         now = time.time()
@@ -352,7 +366,7 @@ def _monitor_backends():
                 if proc is None:
                     continue
                 alive = proc.poll() is None
-                if st == "hot" and alive \
+                if POOL_IDLE_TTL > 0 and st == "hot" and alive \
                         and now - _backend_last_use.get(port, 0) > POOL_IDLE_TTL:
                     to_evict.append(port)
                 elif not alive:
@@ -557,10 +571,14 @@ def _cache_speaker(speaker, voice, speed, wav_bytes, model_key=None):
 LANG_MAP = {"zh": "中文", "ja": "日文", "en": "英文", "yue": "粤语", "ko": "韩文",
             "all_zh": "all_zh", "all_ja": "all_ja"}
 
-# Global serial lock — one inference at a time across all backends.
-# Parallel instances fragment GPU and hurt quality, so requests queue
-# globally; a hot standby instance takes over only if the active one OOMs.
-_tts_lock = threading.Lock()
+# ── 4 路并发：端口租约池 ────────────────────────────────────────
+# 所有端口现在跑同一个 v5Turbo 模型（单 profile、4 ports_per_model）。
+# 旧的全局 _tts_lock 会把所有请求串行化；现在每个请求从租约池取一个端口，
+# 独占到合成结束再归还 —— 最多 4 路真正并行，且同一端口不会被并发_POST。
+# 租约池在 ALL_BACKEND_PORTS 确定后初始化（见下方）。
+_port_lease_lock = threading.Lock()
+# 静音计数器的并发保护（旧代码依赖 _tts_lock，已移除）
+_silent_lock = threading.Lock()
 
 # ── Long-text task management ────────────────────────────────────
 # For audiobook-style synthesis: split text into sentences, synthesize
@@ -991,13 +1009,11 @@ def _run_long_task(task_id, text, voice, speed, model_key=None):
             start = task["done"]  # resume point (0 for fresh tasks)
         _save_task(task_id, dict(_tts_tasks[task_id]))
 
-        # Lazily load the backend this voice is affined to (starts the process
-        # + model on first need). Blocks ~90 s on a cold start, then returns.
-        # Only when sentences actually remain to synthesize: a 点读包 whose
-        # fragments are all present needs the merge below and nothing else,
-        # and must not cold-load a model for it.
-        if start < total and not _ensure_backend_hot(voice_backend_port(voice, key), key):
-            logger.warning("Long-text: backend for voice %r (%s) unavailable at task start", voice, key)
+        # Backends load lazily inside _synthesize() on the first sentence.
+        # The old voice-affinity preload is gone: with a 4-port lease pool any
+        # free port serves any voice, and preloading one port here would pin a
+        # lease-less backend / block a concurrent request during a cold start.
+        # Skip entirely when a 点读包 has all fragments already (nothing to do).
 
         # Load fragments synthesized before a crash, measuring each one's
         # duration on the way in: 点读 converts these into seek offsets inside
@@ -2546,7 +2562,7 @@ def _pad_short_text(text):
 SILENT_RETRY_SAME = 2       # extra POSTs to the same instance after a silent 200
 SILENT_RUN_LIMIT = 3        # silent sentences after which an instance is reloaded
 SILENT_STOP_COOLDOWN = 300  # s — min gap between two silent-triggered reloads
-_silent_run = {}            # port -> consecutive silent sentence count (under _tts_lock)
+_silent_run = {}            # port -> consecutive silent sentence count (under _silent_lock)
 _silent_last_stop = {}      # port -> epoch of last silent-triggered reload
 
 
@@ -2606,81 +2622,92 @@ def _synthesize(text, voice, speed, pad_short=True, model_key=None):
             "top_p": 1.0,
             "temperature": 1.0,
             "seed": -1,
-            "batch_size": 1,
-            # 关掉并行推理 — XPU 上并行批推理易触发显存分配失败(bad allocation)→静音
-            "parallel_infer": False,
+            "batch_size": int(profile.get("batch_size", 1)) if profile.get("parallel_infer", False) else 1,
+            # 并行推理默认开启（实测长文本快约 16%）；静音时下方会自动回退串行重试。
+            "parallel_infer": bool(profile.get("parallel_infer", False)),
             "repetition_penalty": 1.35,
             "streaming_mode": False,
         }
         if profile.get("sample_steps") is not None:
             payload["sample_steps"] = int(profile["sample_steps"])
-        # Serialize globally: one inference at a time.
-        with _tts_lock:
-            for port in _candidate_ports(voice, key):
-                if not _ensure_backend_hot(port, key):
-                    logger.warning("Backend %s (%s) could not be loaded — skip", port, key)
-                    continue
-                backend_url = f"http://127.0.0.1:{port}"
-                hard_fail = False
-                for try_i in range(1 + same_retries):
-                    try:
-                        r = requests.post(f"{backend_url}/tts", json=payload, timeout=300)
-                    except requests.exceptions.Timeout as e:
-                        # Backend hung (read timeout) — kill it to free its
-                        # model, then fail over to the next instance instead of
-                        # aborting. (The instance is stopped first, so only the
-                        # next member loads — single residency kept.)
-                        logger.warning("Backend %s timed out (%s) — stopping & failover", port, e)
-                        _stop_backend(port)
-                        hard_fail = True
-                        break
-                    except requests.exceptions.ConnectionError:
-                        # Died between ensure-hot and here — clear its state so
-                        # the failover below doesn't see a stale "hot" entry.
-                        logger.warning("Backend %s unreachable — failover to next", port)
-                        _stop_backend(port)
-                        hard_fail = True
-                        break
-                    if r.status_code == 200:
-                        if not _is_silent_wav(r.content):
-                            _silent_run[port] = 0   # produced audio — not wedged
-                            return r.content
-                        # Silent 200 — retry the SAME instance: a transient
-                        # XPU "bad allocation → silent" usually clears on the
-                        # next inference, and no model load is involved. The
-                        # energy stats + dump make the verdict checkable later
-                        # (crash: peakWin≈0 · soft real speech: peakWin≳0.02).
-                        stats = _describe_wav(r.content)
-                        dump = _dump_rejected_wav(t, r.content)
-                        logger.warning("Backend %s SILENT for %r (try %d/%d): %s — kept silent_dumps/%s — retry same instance",
-                                       port, t[:20], try_i + 1, 1 + same_retries,
-                                       stats, dump)
-                        time.sleep(1)   # let a crashed inference unwind
+
+        # Take one backend lease. Held for the whole synthesis (including
+        # same-instance retries) and released in `finally`, so at most
+        # len(ALL_BACKEND_PORTS)=4 requests run concurrently and no port is
+        # POSTed twice at once. All ports are the same v5Turbo model.
+        port = _acquire_port(voice, key)
+        try:
+            if not _ensure_backend_hot(port, key):
+                logger.warning("Backend %s (%s) could not be loaded — skip", port, key)
+                return None
+            backend_url = f"http://127.0.0.1:{port}"
+            hard_fail = False
+            serial_fallback = False
+            for try_i in range(1 + same_retries):
+                attempt_payload = payload
+                if serial_fallback:
+                    # Parallel batch inferred silent once — retry this same
+                    # instance in plain serial mode before giving up.
+                    attempt_payload = dict(payload, parallel_infer=False, batch_size=1)
+                try:
+                    r = requests.post(f"{backend_url}/tts", json=attempt_payload, timeout=300)
+                except requests.exceptions.Timeout as e:
+                    # Backend hung — stop it so the next request reloads fresh.
+                    logger.warning("Backend %s timed out (%s) — stopping", port, e)
+                    _stop_backend(port)
+                    hard_fail = True
+                    break
+                except requests.exceptions.ConnectionError:
+                    logger.warning("Backend %s unreachable — clearing state", port)
+                    _stop_backend(port)
+                    hard_fail = True
+                    break
+                if r.status_code == 200:
+                    if not _is_silent_wav(r.content):
+                        with _silent_lock:
+                            _silent_run[port] = 0
+                        return r.content
+                    # Silent 200. If we were in parallel mode, fall back to
+                    # serial on the SAME instance for the remaining retries.
+                    stats = _describe_wav(r.content)
+                    dump = _dump_rejected_wav(t, r.content)
+                    if attempt_payload.get("parallel_infer") and not serial_fallback:
+                        logger.warning("Backend %s SILENT in parallel mode for %r: %s — retrying SERIAL (dump %s)",
+                                       port, t[:20], stats, dump)
+                        serial_fallback = True
                         continue
-                    err = r.text
-                    if "OUT_OF_DEVICE_MEMORY" in err or "OUT_OF_RESOURCES" in err:
-                        logger.warning("Backend %s GPU OOM — stopping & failover to standby", port)
-                        _stop_backend(port)
-                        hard_fail = True
-                        break
-                    raise HTTPException(502, f"Backend error {r.status_code}: {err[:200]}")
-                if hard_fail:
-                    continue      # instance stopped → next member may cold-load
-                # Silent even after same-instance retries. Do NOT fail over for
-                # silence (see policy above) — drop this text here; the padding
-                # fallback below re-attempts ultra-short input.
+                    logger.warning("Backend %s SILENT for %r (try %d/%d): %s — kept silent_dumps/%s — retry same instance",
+                                   port, t[:20], try_i + 1, 1 + same_retries,
+                                   stats, dump)
+                    time.sleep(1)   # let a crashed inference unwind
+                    continue
+                err = r.text
+                if "OUT_OF_DEVICE_MEMORY" in err or "OUT_OF_RESOURCES" in err:
+                    logger.warning("Backend %s GPU OOM — stopping instance", port)
+                    _stop_backend(port)
+                    hard_fail = True
+                    break
+                raise HTTPException(502, f"Backend error {r.status_code}: {err[:200]}")
+
+            if hard_fail:
+                return None
+            # Silent even after same-instance retries (parallel + serial).
+            with _silent_lock:
                 _silent_run[port] = _silent_run.get(port, 0) + 1
                 now = time.time()
-                if (_silent_run[port] >= SILENT_RUN_LIMIT
-                        and now - _silent_last_stop.get(port, 0.0) > SILENT_STOP_COOLDOWN
-                        and _backend_procs.get(port) is not None):
+                do_reload = (_silent_run[port] >= SILENT_RUN_LIMIT
+                             and now - _silent_last_stop.get(port, 0.0) > SILENT_STOP_COOLDOWN
+                             and _backend_procs.get(port) is not None)
+                if do_reload:
                     logger.warning("Backend %s silent on %d sentences — reloading fresh",
                                    port, _silent_run[port])
                     _silent_run[port] = 0
                     _silent_last_stop[port] = now
-                    _stop_backend(port)   # next sentence cold-loads it again
-                return None
-        return None
+            if do_reload:
+                _stop_backend(port)   # next request cold-loads it again
+            return None
+        finally:
+            _release_port(port)
 
     result = _attempt(text)
     if result is None and pad_short:
@@ -2735,7 +2762,7 @@ def tts(req: TTSRequest):
             return StreamingResponse(io.BytesIO(text_wav), media_type="audio/wav",
                 headers={"X-TTS-Time": f"{elapsed:.1f}", "X-TTS-Version": key})
     except requests.exceptions.ConnectionError:
-        raise HTTPException(503, f"Backend {voice_backend_port(voice, key)} not running.")
+        raise HTTPException(503, "No v5Turbo backend reachable.")
     except HTTPException:
         raise
     except Exception as e:
@@ -3091,13 +3118,11 @@ if __name__ == "__main__":
     threading.Thread(target=_cleanup_tasks, daemon=True).start()
     threading.Thread(target=_monitor_backends, daemon=True).start()
 
-    # Backends are NO LONGER pre-loaded at boot. api_v2.py loads its model at
-    # process start (~90 s, one full model per backend), so eager startup would
-    # pin every pool member's model in XPU/RAM forever. Instead each backend is
-    # started lazily on the first synthesis that needs it (_ensure_backend_hot),
-    # and idle ones are unloaded again. Nothing is resident until real work
-    # arrives — and only one model loads at a time.
-    logger.info("Backends will load lazily on first use (pool_size=%s).", POOL_SIZE)
+    # Backends load lazily on first use (each ~2.2 GiB). With one v5Turbo
+    # profile and 4 ports, up to 4 instances stay resident and serve 4
+    # concurrent requests; cold loads are serialized to cap memory spikes.
+    logger.info("v5Turbo-only pool: %s concurrent backends on %s, lazy load, no idle eviction.",
+                len(ALL_BACKEND_PORTS), ALL_BACKEND_PORTS)
 
     # Resume long-text tasks from disk. Each resume thread starts its own
     # backend on demand (see _run_long_task), so no warm-up is needed here.

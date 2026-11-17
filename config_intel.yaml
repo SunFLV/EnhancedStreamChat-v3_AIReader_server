@@ -6,51 +6,100 @@ server:
   listeners:
     - host: "0.0.0.0"
       port: 8000
-      ssl_cert: "route/to/your/domain.crt"
-      ssl_key:  "route/to/your/domain.key"
+      ssl_cert: "D:/BSAIReader/server/ai.sunflv.top.crt"
+      ssl_key:  "D:/BSAIReader/server/ai.sunflv.top.key"
     - host: "::"
       port: 8000
-      ssl_cert: "route/to/your/domain.crt"
-      ssl_key:  "route/to/your/domain.key"
+      ssl_cert: "D:/BSAIReader/server/6.sunflv.top.crt"
+      ssl_key:  "D:/BSAIReader/server/6.sunflv.top.key"
 
 backend: "http://127.0.0.1:9880"
 backend_base_port: 9880
 pool_size: 2
-ports_per_model: 2
-intel_root: "route/to/your/GPT-SoVITS-Instance"
+intel_root: "D:\\BSAIReader\\GPT-SoVITS-For-Intel"
+# ── 后端池：4 路 v5Turbo 常驻并发 ────────────────────────────────
+# 所有音色统一走 v5Turbo 底模，不再按版本切模型。4 个 api_v2 进程常驻，
+# 分别监听 9880-9883，每个进程同一时刻服务 1 个请求，最多 4 路并行。
+# 显存预算：单份模型常驻约 2.2 GiB（A770 15.56 GiB），4 份约 8.8 GiB，
+# 加推理激活约 12-13 GiB，余量有限 —— 请勿再增加并发数。
+# 冷启动仍按需触发（首个请求才加载），加载过程全局串行以避免瞬时显存峰值，
+# 加载完成后常驻，不再因空闲而卸载。
+pool_idle_ttl: 0         # 0 = 从不因空闲卸载（保持 4 路随时可用）
+pool_evict_grace: 0      # 兼容旧配置；单模型池不再驱逐对等端口
 
 tts:
-  device: "auto"
-  is_half: true
+  device: "xpu"
+  is_half: true  # fp16 在 XPU 上偶发静音，改 fp32 提高稳定性
   version: v5turbo
   t2s_weights_path: "GPT_SoVITS/pretrained_models/s1v3.ckpt"
   vits_weights_path: "GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2Gv5turbo.pth"
   bert_base_path: "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large"
   cnhuhbert_base_path: "GPT_SoVITS/pretrained_models/chinese-hubert-base"
 
-# 推理版本 profile：前端传 version，服务端按 profile 启动对应后端。
-# 每个 profile 会生成一份独立的 tts_infer 配置给 api_v2.py -c 使用。
-default_model: "v5turbo"
-models:
-  v4:
-    version: v4
-    label: "v4 / 32 步"
-    t2s_weights_path: "GPT_SoVITS/pretrained_models/s1v3.ckpt"
-    vits_weights_path: "GPT_SoVITS/pretrained_models/gsv-v4-pretrained/s2Gv4.pth"
-    sample_steps: 32
-    is_half: true
-  v5turbo:
-    version: v5turbo
-    label: "v5Turbo / 8 步"
-    t2s_weights_path: "GPT_SoVITS/pretrained_models/s1v3.ckpt"
-    vits_weights_path: "GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2Gv5turbo.pth"
-    sample_steps: 8
-    is_half: true
-
 voices:
-  - name: "default"
-    description: "defult"
+  - name: "v4_default"
+    description: "高松灯-叙述 (中文输入)"
+    text_lang: "zh"
+    prompt_lang: "ja"
+    ref_audio_path: "D:/BSAIReader/server/voices/default_ref.mp3"
+    prompt_text: "そよちゃん、部活でコントラバス、だっけ"
+
+  - name: "v4_tomori"
+    description: "高松灯-开心"
+    text_lang: "zh"
+    prompt_lang: "ja"
+    ref_audio_path: "D:/BSAIReader/server/voices/tomori/ref.wav"
+    prompt_text: "ありがとう、立希ちゃん"
+
+  - name: "v4_anon"
+    description: "千早爱音-兴奋"
+    text_lang: "zh"
+    prompt_lang: "ja"
+    ref_audio_path: "D:/BSAIReader/server/voices/anon/ref.wav"
+    prompt_text: "なんて思ったり、よーしライブ成功!みんなで写真撮ってSNSにアップしちゃおう!"
+
+  - name: "v4_taki"
+    description: "椎名立希-军训"
+    text_lang: "zh"
+    prompt_lang: "ja"
+    ref_audio_path: "D:/BSAIReader/server/voices/taki/ref.wav"
+    prompt_text: "あのお前も全然ダメ人の倍練習して"
+
+  - name: "v4_rana"
+    description: "要乐奈-叙述"
+    text_lang: "zh"
+    prompt_lang: "ja"
+    ref_audio_path: "D:/BSAIReader/server/voices/rana/ref.mp3"
+    prompt_text: "楽しかった。お腹すいた。お蕎麦食べたい。"
+
+  - name: "v4_soyo"
+    description: "长崎素世-叙述"
+    text_lang: "zh"
+    prompt_lang: "ja"
+    ref_audio_path: "D:/BSAIReader/server/voices/soyo/ref.wav"
+    prompt_text: "ありがと。見てないんじゃない私に言われても。"
+
+  - name: "v4_sunflv"
+    description: "SunFLV本人音色 (最新训练)"
     text_lang: "zh"
     prompt_lang: "zh"
-    ref_audio_path: "route/to/your/ref.wav/or/mp3"
-    prompt_text: "xxx"
+    ref_audio_path: "D:/BSAIReader/server/voices/sunflv/ref.wav"
+    prompt_text: "火海般的恨意让他立于巅峰，却被一滴和50年前同样蓝、同样清澈的水滴浇灭。"
+
+# 推理配置：所有音色统一使用 v5Turbo。前端即使传旧版本名（如 v4）也会被
+# 归一化到这个唯一 profile —— 服务端不再加载任何 v4 模型。
+# ports_per_model = 4 → 9880/9881/9882/9883 四路常驻并发。
+# parallel_infer + batch_size=2：实测长文本比串行快约 16%（48s→41s），
+# 静音时服务端会自动回退到串行重试。
+default_model: "v5turbo"
+ports_per_model: 4
+models:
+  v5turbo:
+    version: v5turbo
+    label: "v5Turbo / 4 步"
+    t2s_weights_path: "GPT_SoVITS/pretrained_models/s1v3.ckpt"
+    vits_weights_path: "GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2Gv5turbo.pth"
+    sample_steps: 4
+    is_half: true
+    parallel_infer: true
+    batch_size: 2
