@@ -13,7 +13,7 @@ echo =============================================
 echo   AI TTS Server - Intel XPU
 echo =============================================
 
-for %%p in (9880 9881 9882) do (
+for %%p in (9880 9881 9882 9883) do (
     for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":%%p.*LISTENING" 2^>nul') do (
         echo Killing old backend PID %%a ^(port %%p^)...
         taskkill /f /pid %%a >nul 2>&1
