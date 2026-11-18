@@ -2693,6 +2693,34 @@ def _describe_wav(wav_bytes):
     return f"dur={len(data)/sr:.2f}s gRMS={g:.4f} peakWin={peak:.4f} active={active:.2f}s"
 
 
+def _audio_quality(wav_bytes, text):
+    """整段不静音还不够 —— 模型偶尔会「空转」：AR 一直吐 token 却不发声，
+    结果前半段（甚至 20 多秒）全是静音，直到 early-stop。听感就是"这句开头
+    半天没声音"。按「每字时长」和「最长连续静音」判一次，不合格就重合成。
+
+    返回 (ok, reason)。阈值取自实测：正常朗读 0.20~0.40 s/字，
+    坏样本 0.43~0.60 s/字且伴随 4~23 s 的静音段。"""
+    try:
+        data, sr = sf.read(io.BytesIO(wav_bytes), dtype="float32")
+    except Exception:
+        return True, ""                      # 读不出来就交给上层原有逻辑
+    if getattr(data, "ndim", 1) > 1:
+        data = data.mean(1)
+    if not len(data) or not sr:
+        return True, ""
+    seconds = len(data) / sr
+    per_char = seconds / max(1, len(text or ""))
+    # 最长连续静音（幅度 < 0.01 视为没声音）
+    silent = np.abs(data) < 0.01
+    edges = np.flatnonzero(np.diff(np.concatenate(([0], silent.view(np.int8), [0]))))
+    longest = max([(edges[i + 1] - edges[i]) / sr for i in range(0, len(edges), 2)] or [0])
+    if longest > 4.0 and longest > seconds * 0.2:
+        return False, f"{longest:.1f}s 静音 / {seconds:.1f}s"
+    if per_char > 0.62:
+        return False, f"{per_char:.2f}s 每字（{seconds:.1f}s / {len(text)}字）"
+    return True, ""
+
+
 def _is_silent_wav(wav_bytes):
     """Return True if a WAV's audio contains no audible speech.
 
@@ -3059,6 +3087,14 @@ def _synthesize(text, voice, speed, pad_short=True, model_key=None):
                     break
                 if r.status_code == 200:
                     if not _is_silent_wav(r.content):
+                        ok_q, why_q = _audio_quality(r.content, t)
+                        if not ok_q:
+                            # 空转出来的残缺音频：不算成功，换一次采样再来
+                            logger.warning("Backend %s BAD AUDIO for %r: %s — retry",
+                                           port, t[:20], why_q)
+                            _dump_rejected_wav(t, r.content)
+                            time.sleep(1)
+                            continue
                         with _silent_lock:
                             _silent_run[port] = 0
                         return r.content
