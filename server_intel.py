@@ -371,9 +371,10 @@ def _ensure_backend_hot(port, model_key=None):
 
 
 def _monitor_backends():
-    """Daemon: keep dead backends marked cold for lazy reload. Idle eviction
-    only happens if POOL_IDLE_TTL > 0; the v5-only 4-way pool sets it to 0 so
-    all 4 instances stay resident for concurrency."""
+    """Daemon: unload idle backends to release RAM/XPU memory, and mark dead
+    ones cold for lazy reload. A single loaded model holds ~7 GB RAM, so
+    POOL_IDLE_TTL must stay > 0 on this machine or the box runs out of memory.
+    Idle eviction is skipped only when POOL_IDLE_TTL == 0 (not recommended)."""
     while True:
         time.sleep(15)
         now = time.time()
