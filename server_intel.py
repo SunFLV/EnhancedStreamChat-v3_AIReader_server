@@ -2186,7 +2186,13 @@ function playSentence(i) {
   updateProgress();
   player.style.display = 'block';
   const seekAndPlay = () => {
-    audio.currentTime = offs[i] || 0;
+    const target = offs[i] || 0;
+    // 自动连读跨过句边界时，播放位置本来就在 target 附近 —— timeupdate 有
+    // 250ms 粒度，通常还超前一点。此时再赋一次 currentTime 会让浏览器重新走
+    // 一次 seek（Range 请求 + 解码器重置），听感就是"每句开头卡一下"，而且
+    // 倒回去的那几个字会重复。位置已经对齐就直接续播，不碰 currentTime。
+    const drift = audio.currentTime - target;
+    if (!(drift >= -0.05 && drift <= 0.35)) audio.currentTime = target;
     audio.play().catch(() => {
       $('readerHint').textContent = '⚠️ 自动播放被浏览器阻止，请点击下方的播放器播放';
     });
