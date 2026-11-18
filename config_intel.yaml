@@ -102,6 +102,12 @@ voices:
 # 批量失败（老后端没有 /tts_batch、静音、超长句）会自动退回逐句合成。
 parallel_infer: true
 parallel_batch_size: 8   # 仅 parallel_infer=true 时生效；实测 8 句一批性价比最高
+# 批内长度容忍度：AR 是所有序列同步走一步，批里只要有一句特别长，短句就得
+# padding 陪它跑到最后（槽位空转）。只把长度在 [1/ratio, ratio] 倍的句子凑
+# 一批，离群句自己一批；<=1 表示不约束。
+# A770 / 16 句自然文本实测：不约束 127.1s、ratio=2 143.1s（批被切碎，更慢）、
+# ratio=3 118~127s（与不约束持平，且能把「4 字 vs 67 字」这种极端组合拆开）。
+parallel_batch_len_ratio: 3.0
 
 # 推理配置：所有音色统一使用 v5Turbo。前端即使传旧版本名（如 v4）也会被
 # 归一化到这个唯一 profile —— 服务端不再加载任何 v4 模型。

@@ -78,13 +78,25 @@ if DEFAULT_MODEL not in MODEL_PROFILES:
     DEFAULT_MODEL = MODEL_KEYS[0]
 # ── 并行推理开关：决定实例池策略 ────────────────────────────────
 # parallel_infer=true (默认): 强制单实例 —— 无论请求什么版本，都只用默认模型
-#   的 1 个实例，靠 api_v2 内部 batch_infer 并行。其他模型 profile 直接忽略，
-#   绝不会因为"模型不同"而启动第二个实例（第二个进程会 OOM）。
-#   显存省（单份 ~2.2 GiB），长文本实测快约 16%。
+#   的 1 个实例，靠 api_v2 的 /tts_batch 把多句拼成一次前向一起解码。
+#   其他模型 profile 直接忽略，绝不会因为"模型不同"而启动第二个实例。
+#   显存省（单份 ~2.2 GiB）。
 # parallel_infer=false: 保持原状 —— 每个模型 ports_per_model 个实例并发，
 #   实例内改用串行推理（payload parallel_infer=False, batch_size=1）。
 PARALLEL_INFER = bool(config.get("parallel_infer", True))
 BATCH_SIZE = int(config.get("parallel_batch_size", 8)) if PARALLEL_INFER else 1
+# 批内长度容忍度：AR 是所有序列同步走一步，批里只要有一句特别长，短句就得
+# padding 陪跑到最后（通道空转）。只把长度在 [1/ratio, ratio] 之间的句子凑
+# 一批，离群的句子自己一批。ratio<=1 表示不约束（对比测试用）。
+# 实测（16 句自然文本，A770）：不约束 127.1s；ratio=2 143.1s（批被切碎，更慢）；
+# ratio=3 118.0s。2 倍太紧，3 倍既能保住批大小、又能把「4 字 vs 67 字」这种
+# 极端组合拆开，所以默认 3.0。
+BATCH_LEN_RATIO = float(config.get("parallel_batch_len_ratio", 3.0) or 3.0)
+if BATCH_LEN_RATIO > 1.0:
+    BATCH_LEN_RATIO_LO = 1.0 / BATCH_LEN_RATIO
+    BATCH_LEN_RATIO_HI = BATCH_LEN_RATIO
+else:
+    BATCH_LEN_RATIO_LO, BATCH_LEN_RATIO_HI = 0.0, float("inf")
 # Force-single-instance: collapse all profiles to the default one so no
 # version the frontend sends can ever select a second model/port. This is the
 # root fix for the OOM seen when a different version spun up a 2nd process.
@@ -1083,7 +1095,10 @@ def _run_long_task(task_id, text, voice, speed, model_key=None):
         # the merged chapter audio, so the clips themselves need not be kept.
         # One slot per sentence (0.0 for a skipped one) keeps the list aligned
         # with the split file.
-        chunks = []
+        # 片段按「句子下标」存，不按完成顺序 append：调度随时可能按长度重排
+        # 批次（甚至将来改成动态接活），只要最后按下标组装，音频顺序就永远
+        # 与 sents 一致 —— 点读的 starts 是按 durations 累加的，顺序错一格全乱。
+        chunks = {}
         durations = [0.0] * total   # one slot per sentence, 0.0 = skipped
         for i in range(start):
             f = TASK_CACHE_DIR / f"{task_id}.{i}.wav"
@@ -1094,7 +1109,7 @@ def _run_long_task(task_id, text, voice, speed, model_key=None):
             durations[i] = 0.0
             if f.exists():
                 raw = f.read_bytes()
-                chunks.append(raw)
+                chunks[i] = raw
                 durations[i] = _wav_seconds(raw)
 
         MAX_RETRIES = 10  # 每句最多重试次数（原3次对偶发超时/静音不够）
@@ -1123,16 +1138,15 @@ def _run_long_task(task_id, text, voice, speed, model_key=None):
         def _commit(i, wav):
             if not wav:
                 return
-            chunks.append(wav)
+            chunks[i] = wav
             durations[i] = _wav_seconds(wav)
             # Persist this sentence's audio immediately (crash-proof)
             (TASK_CACHE_DIR / f"{task_id}.{i}.wav").write_bytes(wav)
 
         # ── 逐句 → 分批 ────────────────────────────────────────────
         # 后端是单进程、请求串行的，所以「一句一请求」无论 batch_size 设多少都
-        # 跑不出并行。真正能并行的是：把连续几句拼成一次请求，让模型在同一批
-        # 前向里一起解码（实测 4 句一批 ≈ 逐句耗时的 1/3），后端再把每句的音频
-        # 单独返回，点读时间点不受影响。
+        # 跑不出并行。真正能并行的是：把几句拼成一次请求，让模型在同一批前向
+        # 里一起解码，后端再把每句的音频单独返回，点读时间点不受影响。
         # 注意：一次请求只能有一个 text_lang，所以只把同语言的相邻句并成一批。
         cleaned_all = [_clean_text(s) for s in sents]
         v_default_lang = VOICES.get(voice, VOICES["default"]).get("text_lang", "zh")
@@ -1149,9 +1163,18 @@ def _run_long_task(task_id, text, voice, speed, model_key=None):
                 continue
 
             group = [(i, cleaned)]
+            base_len = len(cleaned)
             nxt = i + 1
             while (len(group) < BATCH_SIZE and nxt < total
                    and cleaned_all[nxt] and langs_all[nxt] == langs_all[i]):
+                # 批内长度要接近。AR 是「所有序列同步走一步」，短句先 EOS 之后
+                # 只能 padding 陪着最长那句走完 —— 4 字的一句要等 67 字的一句跑
+                # 十几秒，这个通道就算白占了。所以只用长度在 0.5x~2x 之间的
+                # 句子凑批；离群的句子自己一批（它本来就快/本来就慢）。
+                # 等价于「谁空了就接活」：批内没有明显更短的句子在空转。
+                n = len(cleaned_all[nxt])
+                if not (base_len * BATCH_LEN_RATIO_LO <= n <= base_len * BATCH_LEN_RATIO_HI):
+                    break
                 group.append((nxt, cleaned_all[nxt]))
                 nxt += 1
 
@@ -1172,7 +1195,9 @@ def _run_long_task(task_id, text, voice, speed, model_key=None):
                 _save_task(task_id, dict(_tts_tasks[task_id]))  # 每批存一次进度
             i = group[-1][0] + 1
 
-        merged, _ = _concat_wav(*chunks) if chunks else (None, None)
+        # 按下标组装：批怎么排、谁先跑完都不影响这里的顺序
+        ordered = [chunks[k] for k in sorted(chunks)]
+        merged, _ = _concat_wav(*ordered) if ordered else (None, None)
         with _tts_tasks_lock:
             task = _tts_tasks[task_id]
             if merged:
