@@ -66,7 +66,7 @@ voices:
   ref_audio_path: D:/BSAIReader/server/voices/sunflv/ref.wav
   prompt_text: 火海般的恨意让他立于巅峰，却被一滴和50年前同样蓝、同样清澈的水滴浇灭。
 parallel_infer: true
-parallel_batch_size: 8
+parallel_batch_size: 4
 parallel_batch_len_ratio: 3.0
 default_model: v5turbo
 ports_per_model: 4

@@ -84,7 +84,7 @@ if DEFAULT_MODEL not in MODEL_PROFILES:
 # parallel_infer=false: 保持原状 —— 每个模型 ports_per_model 个实例并发，
 #   实例内改用串行推理（payload parallel_infer=False, batch_size=1）。
 PARALLEL_INFER = bool(config.get("parallel_infer", True))
-BATCH_SIZE = int(config.get("parallel_batch_size", 8)) if PARALLEL_INFER else 1
+BATCH_SIZE = int(config.get("parallel_batch_size", 4)) if PARALLEL_INFER else 1
 # 批内长度容忍度：AR 是所有序列同步走一步，批里只要有一句特别长，短句就得
 # padding 陪跑到最后（通道空转）。只把长度在 [1/ratio, ratio] 之间的句子凑
 # 一批，离群的句子自己一批。ratio<=1 表示不约束（对比测试用）。
