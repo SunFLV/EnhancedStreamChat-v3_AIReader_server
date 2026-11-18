@@ -72,9 +72,20 @@ if not MODEL_PROFILES:
 MODEL_KEYS = list(MODEL_PROFILES.keys())
 if DEFAULT_MODEL not in MODEL_PROFILES:
     DEFAULT_MODEL = MODEL_KEYS[0]
+# ── 并行推理开关：决定实例池策略 ────────────────────────────────
+# parallel_infer=true (默认): 每个模型只 1 个实例，靠 api_v2 内部 batch_infer
+#   并行。相同模型复用同一实例；只有请求的是另一个模型时才启动第二个实例。
+#   显存省（单份 ~2.2 GiB），长文本实测快约 16%。
+# parallel_infer=false: 保持原状 —— 每个模型 ports_per_model 个实例并发，
+#   实例内改用串行推理（payload parallel_infer=False, batch_size=1）。
+PARALLEL_INFER = bool(config.get("parallel_infer", True))
+BATCH_SIZE = 2 if PARALLEL_INFER else 1
 MODEL_CONFIG_DIR = SCRIPT_DIR / "model_configs"
 MODEL_CONFIG_DIR.mkdir(exist_ok=True)
-PORTS_PER_MODEL = int(config.get("ports_per_model", config.get("pool_size", 1)) or 1)
+# 开启并行推理时每模型固定 1 个端口（模型不同才顺延到下一端口 → 第二实例）；
+# 关闭时恢复 ports_per_model 个端口做多实例并发。
+PORTS_PER_MODEL = (1 if PARALLEL_INFER
+                   else int(config.get("ports_per_model", config.get("pool_size", 1)) or 1))
 MODEL_PORT_BASE = {key: BACKEND_BASE_PORT + i * PORTS_PER_MODEL
                    for i, key in enumerate(MODEL_KEYS)}
 PORT_MODEL = {port: key for key, base in MODEL_PORT_BASE.items()
@@ -93,9 +104,11 @@ for _p in ALL_BACKEND_PORTS:
 def _acquire_port(voice=None, model_key=None):
     """Take a free backend port (blocks until one is available).
 
-    All ports run the identical v5Turbo model, so any free port serves any
-    voice — 4 concurrent requests for the SAME voice still spread across all
-    4 instances. The lease is held until _release_port() after synthesis."""
+    With parallel_infer=true there is one port per model, so all requests for
+    the same model share it and concurrency comes from batch_infer inside that
+    single process. With parallel_infer=false there are several ports per model
+    and requests spread across them. Either way a lease is held until
+    _release_port() after synthesis, so a port is never POSTed twice at once."""
     return _port_leases.get()
 
 
@@ -2622,9 +2635,9 @@ def _synthesize(text, voice, speed, pad_short=True, model_key=None):
             "top_p": 1.0,
             "temperature": 1.0,
             "seed": -1,
-            "batch_size": int(profile.get("batch_size", 1)) if profile.get("parallel_infer", False) else 1,
-            # 并行推理默认开启（实测长文本快约 16%）；静音时下方会自动回退串行重试。
-            "parallel_infer": bool(profile.get("parallel_infer", False)),
+            "batch_size": BATCH_SIZE,
+            # 实例内并行由启动配置 parallel_infer 控制；静音时下方自动回退串行。
+            "parallel_infer": PARALLEL_INFER,
             "repetition_penalty": 1.35,
             "streaming_mode": False,
         }
@@ -3121,8 +3134,9 @@ if __name__ == "__main__":
     # Backends load lazily on first use (each ~2.2 GiB). With one v5Turbo
     # profile and 4 ports, up to 4 instances stay resident and serve 4
     # concurrent requests; cold loads are serialized to cap memory spikes.
-    logger.info("v5Turbo-only pool: %s concurrent backends on %s, lazy load, no idle eviction.",
-                len(ALL_BACKEND_PORTS), ALL_BACKEND_PORTS)
+    mode = "in-process batch parallel" if PARALLEL_INFER else "multi-instance concurrent"
+    logger.info("v5Turbo-only pool (%s): %s backend(s) on %s, batch_size=%s, lazy load, no idle eviction.",
+                mode, len(ALL_BACKEND_PORTS), ALL_BACKEND_PORTS, BATCH_SIZE)
 
     # Resume long-text tasks from disk. Each resume thread starts its own
     # backend on demand (see _run_long_task), so no warm-up is needed here.
