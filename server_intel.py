@@ -97,6 +97,10 @@ if BATCH_LEN_RATIO > 1.0:
     BATCH_LEN_RATIO_HI = BATCH_LEN_RATIO
 else:
     BATCH_LEN_RATIO_LO, BATCH_LEN_RATIO_HI = 0.0, float("inf")
+# dynamic_batch=true：后端槽位一空就补下一句（真正的「接活」）。此时批内长度
+# 不必相近（短的做完立刻换新的），服务端一次提交 queued 句，由后端自己控并发。
+DYNAMIC_BATCH = bool(config.get("dynamic_batch", True)) and PARALLEL_INFER
+QUEUE_SIZE = int(config.get("parallel_queue_size", 32)) if DYNAMIC_BATCH else BATCH_SIZE
 # Force-single-instance: collapse all profiles to the default one so no
 # version the frontend sends can ever select a second model/port. This is the
 # root fix for the OOM seen when a different version spun up a 2nd process.
@@ -1163,32 +1167,68 @@ def _run_long_task(task_id, text, voice, speed, model_key=None):
                 continue
 
             group = [(i, cleaned)]
-            base_len = len(cleaned)
-            nxt = i + 1
-            while (len(group) < BATCH_SIZE and nxt < total
-                   and cleaned_all[nxt] and langs_all[nxt] == langs_all[i]):
-                # 批内长度要接近。AR 是「所有序列同步走一步」，短句先 EOS 之后
-                # 只能 padding 陪着最长那句走完 —— 4 字的一句要等 67 字的一句跑
-                # 十几秒，这个通道就算白占了。所以只用长度在 0.5x~2x 之间的
-                # 句子凑批；离群的句子自己一批（它本来就快/本来就慢）。
-                # 等价于「谁空了就接活」：批内没有明显更短的句子在空转。
-                n = len(cleaned_all[nxt])
-                if not (base_len * BATCH_LEN_RATIO_LO <= n <= base_len * BATCH_LEN_RATIO_HI):
-                    break
-                group.append((nxt, cleaned_all[nxt]))
-                nxt += 1
+            if DYNAMIC_BATCH:
+                # 动态接活：批内长度随便混（短句做完立刻补下一句），只要求同语言、
+                # 不超过一次请求的队列长度；并发槽位由后端 BATCH_SIZE 控制。
+                nxt = i + 1
+                while (len(group) < QUEUE_SIZE and nxt < total
+                       and cleaned_all[nxt] and langs_all[nxt] == langs_all[i]):
+                    group.append((nxt, cleaned_all[nxt]))
+                    nxt += 1
+            else:
+                base_len = len(cleaned)
+                nxt = i + 1
+                while (len(group) < BATCH_SIZE and nxt < total
+                       and cleaned_all[nxt] and langs_all[nxt] == langs_all[i]):
+                    # 批内长度要接近。AR 是「所有序列同步走一步」，短句先 EOS 之后
+                    # 只能 padding 陪着最长那句走完 —— 4 字的一句要等 67 字的一句跑
+                    # 十几秒，这个通道就算白占了。所以只用长度在 1/ratio~ratio 之间
+                    # 的句子凑批；离群的句子自己一批（它本来就快/本来就慢）。
+                    n = len(cleaned_all[nxt])
+                    if not (base_len * BATCH_LEN_RATIO_LO <= n <= BATCH_LEN_RATIO_HI):
+                        break
+                    group.append((nxt, cleaned_all[nxt]))
+                    nxt += 1
 
-            wavs = None
-            if len(group) > 1:
-                wavs = _synthesize_batch([t for _, t in group], voice, speed, model_key=key)
-            if wavs is None:
-                # 单句，或这一批整体失败（老后端/超长/接口报错）→ 全部退回逐句
-                wavs = [_synth_one(t, gi) for gi, t in group]
-            elif any(w is None for w in wavs):
-                # 批量里个别句子抽到静音：只补那几句，其余照用
-                wavs = [w if w else _synth_one(t, gi) for (gi, t), w in zip(group, wavs)]
-            for (gi, _t), wav in zip(group, wavs):
+            committed = set()
+
+            def _on_item(seq, wav):
+                """后端每算好一句就回调：立刻落盘 + 推进「连续完成前缀」。"""
+                gi = group[seq][0]
                 _commit(gi, wav)
+                committed.add(gi)
+                d = group[0][0]
+                while d in committed:
+                    d += 1
+                with _tts_tasks_lock:
+                    _tts_tasks[task_id]["done"] = d
+                    # 每 4 句落一次盘，避免几百句的小文件反复写
+                    if len(committed) % 4 == 0:
+                        _save_task(task_id, dict(_tts_tasks[task_id]))
+
+            if len(group) > 1:
+                got = (_synthesize_batch_stream([t for _, t in group], voice, speed, key, _on_item)
+                       if DYNAMIC_BATCH else None)
+                if got is None:
+                    # 流式不可用（老后端/报错）→ 退回一次性批量，再不行逐句
+                    wavs = _synthesize_batch([t for _, t in group], voice, speed, model_key=key)
+                    if wavs is None:
+                        wavs = [_synth_one(t, gi) for gi, t in group]
+                    elif any(w is None for w in wavs):
+                        wavs = [w if w else _synth_one(t, gi) for (gi, t), w in zip(group, wavs)]
+                    for (gi, _t), wav in zip(group, wavs):
+                        _commit(gi, wav)
+                        committed.add(gi)
+            else:
+                _commit(group[0][0], _synth_one(group[0][1], group[0][0]))
+                committed.add(group[0][0])
+
+            # 流式里被判静音、或整批失败漏掉的句子：逐句补
+            for gi, gt in group:
+                if gi not in committed:
+                    wav = _synth_one(gt, gi)
+                    if wav:
+                        _commit(gi, wav)
 
             with _tts_tasks_lock:
                 _tts_tasks[task_id]["done"] = group[-1][0] + 1
@@ -2750,6 +2790,86 @@ _silent_run = {}            # port -> consecutive silent sentence count (under _
 _silent_last_stop = {}      # port -> epoch of last silent-triggered reload
 
 
+def _synthesize_batch_stream(texts, voice, speed, model_key, on_item, deadline=None):
+    """一次请求提交整段句子，**收到一句就回调一句**（on_item(seq_index, wav)）。
+
+    后端 /tts_batch_stream 是动态接活的流式接口：槽位一空就补下一句，每句
+    生成完立刻发一行 {index, wav}。所以我们这里边收边落盘 —— 点读的「已就绪」
+    和进度条都不必等整批。
+
+    返回处理成功的句数；不可用时返回 None（调用方退回静态批/逐句）。
+    """
+    if not texts or len(texts) < 2:
+        return None
+    key = _resolve_model_key(model_key)
+    profile = MODEL_PROFILES[key]
+    v = VOICES.get(voice, VOICES["default"])
+    default_lang = v.get("text_lang", "zh")
+    text_lang = _pick_lang(texts[0], default_lang)
+    if any(_pick_lang(t, default_lang) != text_lang for t in texts):
+        return None
+    payload = {
+        "texts": list(texts),
+        "text": "",
+        "text_lang": text_lang,
+        "ref_audio_path": v.get("ref_audio_path", ""),
+        "prompt_text": v.get("prompt_text", ""),
+        "prompt_lang": v.get("prompt_lang", "zh"),
+        "speed_factor": speed,
+        "batch_size": BATCH_SIZE,       # 并发槽位数（不是句数）
+        "dynamic_batch": True,
+        "top_k": 5,
+        "top_p": 1.0,
+        "temperature": 1.0,
+        "seed": -1,
+        "parallel_infer": True,
+        "repetition_penalty": 1.35,
+        "streaming_mode": False,
+    }
+    if profile.get("sample_steps") is not None:
+        payload["sample_steps"] = int(profile["sample_steps"])
+
+    port = _acquire_port(voice, key)
+    tries = 0
+    try:
+        if not _ensure_backend_hot(port, key):
+            return None
+        r = requests.post(f"http://127.0.0.1:{port}/tts_batch_stream",
+                          json=payload, stream=True, timeout=(15, 1800))
+        if r.status_code == 404:
+            logger.info("Backend %s has no /tts_batch_stream — fallback", port)
+            return None
+        if r.status_code != 200:
+            logger.warning("Stream batch rejected (%s): %s — fallback",
+                           r.status_code, r.text[:160])
+            return None
+        got = 0
+        for line in r.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            item = json.loads(line)
+            if "error" in item:
+                logger.warning("Stream batch error after %d item(s): %s", got, item["error"])
+                return got or None
+            idx = int(item["index"])
+            if not (0 <= idx < len(texts)):
+                continue
+            wav = base64.b64decode(item["wav"])
+            if _is_silent_wav(wav):
+                # 静音：不落盘，留给调用方逐句重试这一句
+                logger.warning("Stream batch: sentence %d silent — will retry singly", idx + 1)
+                tries += 1
+                continue
+            on_item(idx, wav)
+            got += 1
+        return got
+    except Exception as e:
+        logger.warning("Stream batch failed (%s) — fallback", e)
+        return None
+    finally:
+        _release_port(port)
+
+
 def _synthesize_batch(texts, voice, speed, model_key=None):
     """一次请求合成多句（同一种 text_lang），逐句返回 WAV 字节；不可用时 None。
 
@@ -2778,7 +2898,9 @@ def _synthesize_batch(texts, voice, speed, model_key=None):
         "prompt_text": v.get("prompt_text", ""),
         "prompt_lang": v.get("prompt_lang", "zh"),
         "speed_factor": speed,
-        "batch_size": len(texts),
+        # 动态接活时 batch_size 是「并发槽位」数，句子数可以远多于它
+        "batch_size": BATCH_SIZE if DYNAMIC_BATCH else len(texts),
+        "dynamic_batch": DYNAMIC_BATCH,
         "top_k": 5,
         "top_p": 1.0,
         "temperature": 1.0,

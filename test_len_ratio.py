@@ -49,13 +49,17 @@ def main():
 
     t0 = time.time()
     last = -1
+    steps = []
     while True:
         p = get(f"{BASE}/api/tts/progress/{tid}")
         if p["done"] != last:
             last = p["done"]
+            steps.append(last)
+            print(f"  +{time.time()-t0:6.1f}s done={last}/{p['total']}")
         if p["status"] in ("done", "error"):
             break
         time.sleep(0.3)
+    print("progress steps:", steps)
     wall = time.time() - t0
 
     doc = get(f"{BASE}/api/tts/split/{tid}")
