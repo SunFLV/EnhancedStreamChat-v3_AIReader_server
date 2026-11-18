@@ -79,7 +79,7 @@ if DEFAULT_MODEL not in MODEL_PROFILES:
 # parallel_infer=false: 保持原状 —— 每个模型 ports_per_model 个实例并发，
 #   实例内改用串行推理（payload parallel_infer=False, batch_size=1）。
 PARALLEL_INFER = bool(config.get("parallel_infer", True))
-BATCH_SIZE = 2 if PARALLEL_INFER else 1
+BATCH_SIZE = int(config.get("parallel_batch_size", 4)) if PARALLEL_INFER else 1
 MODEL_CONFIG_DIR = SCRIPT_DIR / "model_configs"
 MODEL_CONFIG_DIR.mkdir(exist_ok=True)
 # 开启并行推理时每模型固定 1 个端口（模型不同才顺延到下一端口 → 第二实例）；
