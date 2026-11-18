@@ -73,17 +73,23 @@ MODEL_KEYS = list(MODEL_PROFILES.keys())
 if DEFAULT_MODEL not in MODEL_PROFILES:
     DEFAULT_MODEL = MODEL_KEYS[0]
 # ── 并行推理开关：决定实例池策略 ────────────────────────────────
-# parallel_infer=true (默认): 每个模型只 1 个实例，靠 api_v2 内部 batch_infer
-#   并行。相同模型复用同一实例；只有请求的是另一个模型时才启动第二个实例。
+# parallel_infer=true (默认): 强制单实例 —— 无论请求什么版本，都只用默认模型
+#   的 1 个实例，靠 api_v2 内部 batch_infer 并行。其他模型 profile 直接忽略，
+#   绝不会因为"模型不同"而启动第二个实例（第二个进程会 OOM）。
 #   显存省（单份 ~2.2 GiB），长文本实测快约 16%。
 # parallel_infer=false: 保持原状 —— 每个模型 ports_per_model 个实例并发，
 #   实例内改用串行推理（payload parallel_infer=False, batch_size=1）。
 PARALLEL_INFER = bool(config.get("parallel_infer", True))
 BATCH_SIZE = int(config.get("parallel_batch_size", 4)) if PARALLEL_INFER else 1
+# Force-single-instance: collapse all profiles to the default one so no
+# version the frontend sends can ever select a second model/port. This is the
+# root fix for the OOM seen when a different version spun up a 2nd process.
+if PARALLEL_INFER and DEFAULT_MODEL in MODEL_PROFILES:
+    MODEL_PROFILES = {DEFAULT_MODEL: MODEL_PROFILES[DEFAULT_MODEL]}
+    MODEL_KEYS = [DEFAULT_MODEL]
 MODEL_CONFIG_DIR = SCRIPT_DIR / "model_configs"
 MODEL_CONFIG_DIR.mkdir(exist_ok=True)
-# 开启并行推理时每模型固定 1 个端口（模型不同才顺延到下一端口 → 第二实例）；
-# 关闭时恢复 ports_per_model 个端口做多实例并发。
+# 单实例模式只有 1 个端口；关闭并行时恢复 ports_per_model 个端口做多实例并发。
 PORTS_PER_MODEL = (1 if PARALLEL_INFER
                    else int(config.get("ports_per_model", config.get("pool_size", 1)) or 1))
 MODEL_PORT_BASE = {key: BACKEND_BASE_PORT + i * PORTS_PER_MODEL
@@ -335,9 +341,9 @@ def _ensure_backend_hot(port, model_key=None):
                 and _backend_model.get(port) in (None, key)):
             _touch(port)
             return True
-    # Single-model pool: no peer eviction. All 4 ports hold the same v5Turbo
-    # model and must stay resident for 4-way concurrency. Loads stay serialized
-    # under _warm_lock so 4 cold starts never spike XPU memory at once.
+    # Single-model pool: no peer eviction. Every port holds the same v5Turbo
+    # model, so hot peers are never stopped to make room. Loads stay serialized
+    # under _warm_lock so concurrent cold starts never spike XPU memory.
     with _warm_lock:
         with _pool_lock:
             if (_backend_state.get(port) == "hot" and _port_in_use(port)
