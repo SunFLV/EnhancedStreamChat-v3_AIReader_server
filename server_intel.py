@@ -11,6 +11,7 @@ import io
 import os
 import time
 import json
+import base64
 import logging
 from pathlib import Path
 
@@ -28,7 +29,10 @@ logger = logging.getLogger("tts-proxy")
 
 # ── Config ───────────────────────────────────────────────────────
 SCRIPT_DIR = Path(__file__).parent.absolute()
-with open(SCRIPT_DIR / "config_intel.yaml", "r", encoding="utf-8") as f:
+# BSAI_CONFIG 可指向另一份配置：便于开一个「不影响线上」的测试实例
+# （不同监听端口 + 不同 backend_base_port，共用同一套代码）。
+CONFIG_PATH = Path(os.environ.get("BSAI_CONFIG") or (SCRIPT_DIR / "config_intel.yaml"))
+with open(CONFIG_PATH, "r", encoding="utf-8") as f:
     config = yaml.safe_load(f)
 
 BACKEND = config.get("backend", "http://127.0.0.1:9880")
@@ -80,7 +84,7 @@ if DEFAULT_MODEL not in MODEL_PROFILES:
 # parallel_infer=false: 保持原状 —— 每个模型 ports_per_model 个实例并发，
 #   实例内改用串行推理（payload parallel_infer=False, batch_size=1）。
 PARALLEL_INFER = bool(config.get("parallel_infer", True))
-BATCH_SIZE = int(config.get("parallel_batch_size", 4)) if PARALLEL_INFER else 1
+BATCH_SIZE = int(config.get("parallel_batch_size", 8)) if PARALLEL_INFER else 1
 # Force-single-instance: collapse all profiles to the default one so no
 # version the frontend sends can ever select a second model/port. This is the
 # root fix for the OOM seen when a different version spun up a 2nd process.
@@ -609,7 +613,7 @@ _tts_tasks = {}
 _tts_tasks_lock = threading.Lock()
 MAX_TASKS = 50
 TASK_TTL = 172800  # seconds (48h = 2 days) — tasks + WAV files auto-expire
-TASK_CACHE_DIR = SCRIPT_DIR / "task_cache"
+TASK_CACHE_DIR = Path(os.environ.get("BSAI_TASK_CACHE") or (SCRIPT_DIR / "task_cache"))
 TASK_CACHE_DIR.mkdir(exist_ok=True)
 
 
@@ -931,6 +935,43 @@ def _emoji_to_cn(text):
     return text
 
 
+# ── 符号 → 读音 ────────────────────────────────────────────────────
+# GPT-SoVITS 的文本前端会在归一化阶段**静默丢弃**这些符号（实测：后端日志里
+# “A+B=3” 出来是 “A Bthree”，+ 和 = 直接没了；℃ 属于非白名单字符，更早一步
+# 就被 _clean_text 丢掉）。所以必须在送进后端之前换成读音，否则整段意思会缺字。
+_SYMBOL_SPEECH = {
+    # 温度 / 角度
+    "℃": "摄氏度", "℉": "华氏度", "°": "度",
+    # 数学 / 比较
+    "+": "加", "＋": "加", "=": "等于", "＝": "等于",
+    "×": "乘", "✕": "乘", "✖": "乘", "÷": "除以",
+    "±": "正负", "≈": "约等于", "≠": "不等于",
+    "≥": "大于等于", "≤": "小于等于",
+    "＜": "小于", "＞": "大于",
+    # 连接符
+    "&": "和", "＆": "和", "→": "到", "←": "到",
+    # 其他
+    "‰": "千分之", "№": "编号",
+}
+# 装饰性重复符号（章节分隔线 ===== / ---- / **** / ####）不读，先压成空格
+_DECOR_RUN = re.compile(r"([=\-*#~_+·])\1{2,}")
+
+
+def _symbols_to_cn(text):
+    """把“念不出来”的符号换成中文读音；装饰性符号直接去掉。
+
+    `%` 不在这里处理：语音前端自己会把 “50%” 读成“百分之五十”，改动反而更糟。
+    `~` 只在数字之间读“到”（3~5 分钟），其他位置（颜文字）保持原样。"""
+    if not text:
+        return ""
+    text = _DECOR_RUN.sub(" ", text)
+    for sym, word in _SYMBOL_SPEECH.items():
+        if sym in text:
+            text = text.replace(sym, word)
+    text = re.sub(r"(?<=\d)\s*[~～〜]\s*(?=\d)", "到", text)
+    return text
+
+
 def _clean_text(text):
     """Convert emojis to Chinese words, then KEEP ONLY characters that
     GPT-SoVITS can synthesize (CJK, kana, hangul, ASCII, full-width punct).
@@ -939,6 +980,8 @@ def _clean_text(text):
     import re
     if not text:
         return ""
+    # 符号 → 读音（必须在白名单过滤之前：℃ 这类字符不在白名单里）
+    text = _symbols_to_cn(text)
     # Emojis → spoken Chinese (curated danmaku words, then CLDR zh short names)
     text = _emoji_to_cn(text)
 
@@ -1055,24 +1098,14 @@ def _run_long_task(task_id, text, voice, speed, model_key=None):
                 durations[i] = _wav_seconds(raw)
 
         MAX_RETRIES = 10  # 每句最多重试次数（原3次对偶发超时/静音不够）
-        for i in range(start, total):
-            # Clean unsupported chars — keep sentence body, drop emojis/etc
-            cleaned = _clean_text(sents[i])
-            if not cleaned:
-                logger.warning("Long-text: sentence %d empty after cleanup — skipping", i + 1)
-                with _tts_tasks_lock:
-                    _tts_tasks[task_id]["done"] = i + 1
-                continue
-            ok = False
+
+        def _synth_one(text, i):
+            """单句合成（带重试）。批处理失败时的回退路径。"""
             for attempt in range(MAX_RETRIES):
                 try:
-                    wav = _synthesize(cleaned, voice, speed, pad_short=False, model_key=key)
-                    chunks.append(wav)
-                    durations[i] = _wav_seconds(wav)
-                    # Persist this sentence's audio immediately (crash-proof)
-                    (TASK_CACHE_DIR / f"{task_id}.{i}.wav").write_bytes(wav)
-                    ok = True
-                    break
+                    wav = _synthesize(text, voice, speed, pad_short=False, model_key=key)
+                    if wav:
+                        return wav
                 except HTTPException as e:
                     logger.warning("Long-text: sentence %d attempt %d/%d failed: %s",
                                    i + 1, attempt + 1, MAX_RETRIES, e.detail)
@@ -1084,11 +1117,60 @@ def _run_long_task(task_id, text, voice, speed, model_key=None):
                     logger.warning("Long-text: sentence %d attempt %d/%d request error: %s",
                                    i + 1, attempt + 1, MAX_RETRIES, e)
                     time.sleep(1)
-            if not ok:
-                logger.warning("Long-text: sentence %d SKIPPED after %d attempts", i + 1, MAX_RETRIES)
+            logger.warning("Long-text: sentence %d SKIPPED after %d attempts", i + 1, MAX_RETRIES)
+            return None
+
+        def _commit(i, wav):
+            if not wav:
+                return
+            chunks.append(wav)
+            durations[i] = _wav_seconds(wav)
+            # Persist this sentence's audio immediately (crash-proof)
+            (TASK_CACHE_DIR / f"{task_id}.{i}.wav").write_bytes(wav)
+
+        # ── 逐句 → 分批 ────────────────────────────────────────────
+        # 后端是单进程、请求串行的，所以「一句一请求」无论 batch_size 设多少都
+        # 跑不出并行。真正能并行的是：把连续几句拼成一次请求，让模型在同一批
+        # 前向里一起解码（实测 4 句一批 ≈ 逐句耗时的 1/3），后端再把每句的音频
+        # 单独返回，点读时间点不受影响。
+        # 注意：一次请求只能有一个 text_lang，所以只把同语言的相邻句并成一批。
+        cleaned_all = [_clean_text(s) for s in sents]
+        v_default_lang = VOICES.get(voice, VOICES["default"]).get("text_lang", "zh")
+        langs_all = [_pick_lang(t, v_default_lang) if t else None for t in cleaned_all]
+
+        i = start
+        while i < total:
+            cleaned = cleaned_all[i]
+            if not cleaned:
+                logger.warning("Long-text: sentence %d empty after cleanup — skipping", i + 1)
+                with _tts_tasks_lock:
+                    _tts_tasks[task_id]["done"] = i + 1
+                i += 1
+                continue
+
+            group = [(i, cleaned)]
+            nxt = i + 1
+            while (len(group) < BATCH_SIZE and nxt < total
+                   and cleaned_all[nxt] and langs_all[nxt] == langs_all[i]):
+                group.append((nxt, cleaned_all[nxt]))
+                nxt += 1
+
+            wavs = None
+            if len(group) > 1:
+                wavs = _synthesize_batch([t for _, t in group], voice, speed, model_key=key)
+            if wavs is None:
+                # 单句，或这一批整体失败（老后端/超长/接口报错）→ 全部退回逐句
+                wavs = [_synth_one(t, gi) for gi, t in group]
+            elif any(w is None for w in wavs):
+                # 批量里个别句子抽到静音：只补那几句，其余照用
+                wavs = [w if w else _synth_one(t, gi) for (gi, t), w in zip(group, wavs)]
+            for (gi, _t), wav in zip(group, wavs):
+                _commit(gi, wav)
+
             with _tts_tasks_lock:
-                _tts_tasks[task_id]["done"] = i + 1
-                _save_task(task_id, dict(_tts_tasks[task_id]))  # progress per sentence
+                _tts_tasks[task_id]["done"] = group[-1][0] + 1
+                _save_task(task_id, dict(_tts_tasks[task_id]))  # 每批存一次进度
+            i = group[-1][0] + 1
 
         merged, _ = _concat_wav(*chunks) if chunks else (None, None)
         with _tts_tasks_lock:
@@ -1426,6 +1508,7 @@ const $ = id => document.getElementById(id);
 const status = $('status'), player = $('player'), audio = $('audio');
 const voiceLong = $('voiceLong');
 const versionLong = $('versionLong');
+const longBtn = $('longBtn');
 
 async function loadVoices() {
   try {
@@ -1449,6 +1532,10 @@ $('speedLong').oninput = e => $('speedValLong').textContent = (+e.target.value).
 const progressWrap = $('progressWrap'), progressFill = $('progressFill'), progressText = $('progressText');
 let pollTimer = null;
 let pollTaskId = null;      // 正在轮询的任务：同一个任务只跑一条轮询链
+let pollFails = 0;          // 连续失败次数（服务器重启/断网时重试，不立刻放弃）
+const POLL_MS = 800;        // 合成中的轮询间隔
+const POLL_RETRY_MS = 2000; // 请求失败后的重试间隔
+const POLL_MAX_FAILS = 5;   // 连续失败这么多次才放弃
 
 function showProgress(pct, label) {
   progressWrap.style.display = 'block';
@@ -1456,47 +1543,85 @@ function showProgress(pct, label) {
   progressText.textContent = label;
 }
 
+// 结束轮询链。只清理「自己那条」：换了任务以后，旧链的收尾不能把新链掐掉。
+function endPoll(taskId) {
+  if (pollTaskId !== taskId) return;
+  clearTimeout(pollTimer);
+  pollTimer = null;
+  pollTaskId = null;
+  longBtn.disabled = false;
+}
+
+// 轮询入口（提交任务 / 恢复任务 / 打开点读时调用）：同一个任务已经在轮询就
+// 直接返回，让调用方复用现有那条链，而不是叠加第二条。
+// 真正的循环在 pollTick 里 —— 入口的守卫**不能**挂在 tick 上，否则
+// `setTimeout(() => pollTask(id))` 回到入口时会被自己挡住：轮询只跑一次，
+// 进度条和点读页就永远停在第一帧（合成完成后也不更新）。
 async function pollTask(taskId) {
   if (pollTaskId === taskId) return;      // 已经在轮询这个任务
   clearTimeout(pollTimer);
   pollTaskId = taskId;
-  const finish = () => { pollTaskId = null; longBtn.disabled = false; };
-  try {
-    const r = await fetch(`/api/tts/progress/${taskId}`);
-    const p = await r.json();
-    const pct = p.total ? Math.round(p.done / p.total * 100) : 0;
-    showProgress(pct, `正在合成 ${p.done}/${p.total} 句（${pct}%）…`);
+  pollFails = 0;
+  return pollTick(taskId);
+}
 
-    if (p.status === 'done') {
-      showProgress(100, '✅ 合成完成 — 可在下方点读');
-      $('sendToRead').textContent = '📖 打开点读';
-      finish();
-      // 点读里就地升级成整章音频（不重排、不跳页），否则装回合成结果
-      if (partialMode) { upgradeToFinal(); return; }
-      // No auto-play: a chapter can run for hours. The player is pointed at
-      // the result (Range-enabled, so seeking works) and 点读 drives it.
-      audio.src = `/api/tts/result/${taskId}`;
-      audio.volume = 1.0;
-      player.style.display = 'block';
-      await loadReader(taskId);
-      return;
-    }
-    if (p.status === 'error') {
-      showProgress(0, '❌ 合成失败: ' + (p.error || '未知错误'));
-      finish();
-      if (partialMode) {
-        $('readerHint').textContent = `⚠️ 合成中断（${p.error || '未知错误'}）：`
-          + `已就绪的 ${readyCount()}/${p.total} 句仍可点读`;
-      }
-      return;
-    }
-    // 合成中：partial 点读跟着进度换更长的前缀音频
-    if (partialMode && splitDoc && p.done !== readyCount()) await refreshPartial();
-    pollTimer = setTimeout(() => pollTask(taskId), 800);
+async function pollTick(taskId) {
+  if (pollTaskId !== taskId) return;      // 已换成别的任务 / 已收尾
+  let p;
+  try {
+    const r = await fetch(`/api/tts/progress/${taskId}`, { cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    p = await r.json();
   } catch(e) {
-    finish();
-    showProgress(0, '❌ 轮询失败: ' + e);
+    if (pollTaskId !== taskId) return;
+    if (++pollFails >= POLL_MAX_FAILS) {
+      endPoll(taskId);
+      showProgress(0, '❌ 轮询失败: ' + e + '（可凭任务ID恢复进度）');
+      return;
+    }
+    showProgress(0, `⚠️ 与服务器断开（${e}），${POLL_RETRY_MS / 1000}s 后重试 `
+      + `${pollFails}/${POLL_MAX_FAILS}…`);
+    pollTimer = setTimeout(() => pollTick(taskId), POLL_RETRY_MS);
+    return;
   }
+  if (pollTaskId !== taskId) return;      // await 期间被换掉了
+  pollFails = 0;
+  // 进度接口顺带给了后端池快照：状态条跟着走，不必等下一次兜底轮询
+  if (p.pool) { bkPool = p.pool; bkRender(); }
+
+  const pct = p.total ? Math.round(p.done / p.total * 100) : 0;
+
+  if (p.status === 'done') {
+    showProgress(100, '✅ 合成完成 — 可在下方点读');
+    $('sendToRead').textContent = '📖 打开点读';
+    endPoll(taskId);
+    // 点读里就地升级成整章音频（不重排、不跳页），否则装回合成结果
+    if (partialMode) { upgradeToFinal(); return; }
+    // No auto-play: a chapter can run for hours. The player is pointed at
+    // the result (Range-enabled, so seeking works) and 点读 drives it.
+    audio.src = `/api/tts/result/${taskId}`;
+    audio.volume = 1.0;
+    player.style.display = 'block';
+    await loadReader(taskId);
+    return;
+  }
+  if (p.status === 'error') {
+    showProgress(0, '❌ 合成失败: ' + (p.error || '未知错误'));
+    endPoll(taskId);
+    if (partialMode) {
+      $('readerHint').textContent = `⚠️ 合成中断（${p.error || '未知错误'}）：`
+        + `已就绪的 ${readyCount()}/${p.total} 句仍可点读`;
+    }
+    return;
+  }
+  // 排队中（还没拿到后端）与合成中分开显示，避免「0/0 句（0%）」这种死进度
+  showProgress(pct, p.status === 'queued' || !p.total
+    ? '⏳ 排队中：等待空闲后端…'
+    : `正在合成 ${p.done}/${p.total} 句（${pct}%）…`);
+  // 合成中：partial 点读跟着进度换更长的前缀音频
+  if (partialMode && splitDoc && p.done !== readyCount()) await refreshPartial();
+  if (pollTaskId !== taskId) return;      // refreshPartial 期间任务被换掉
+  pollTimer = setTimeout(() => pollTick(taskId), POLL_MS);
 }
 
 let currentTaskId = null;
@@ -2250,8 +2375,8 @@ $('importBtn').onclick = async () => {
   }
 };
 
-// ── 后端引擎状态条：初始快照 + SSE 实时推送 ──
-let bkPool = [], bkEvents = [];
+// ── 后端引擎状态条：初始快照 + SSE 实时推送 + 兜底轮询 ──
+let bkPool = [], bkEvents = [], bkPulling = false;
 
 function bkRender() {
   const chips = $('bkChips'), msg = $('bkMsg');
@@ -2286,14 +2411,29 @@ function bkRender() {
   }
 }
 
-function initBackendStatus() {
-  fetch('/api/backend/status')
+// 拉一次完整快照。SSE 只是「快」的那条路，不能当成唯一来源：连接被代理
+// 缓冲 / 手机休眠后不报错也不再送事件时，界面就会永久停在旧状态。
+function bkPull() {
+  if (bkPulling) return;
+  bkPulling = true;
+  fetch('/api/backend/status', { cache: 'no-store' })
     .then(r => r.json())
     .then(d => { bkPool = d.backends || []; bkEvents = (d.events || []).slice(-1); bkRender(); })
-    .catch(() => {});
+    .catch(() => {})
+    .then(() => { bkPulling = false; });
+}
+
+function initBackendStatus() {
+  bkPull();
+  // 兜底轮询：状态条 5 s 对齐一次（也让「加载中 N s」跟着走）
+  setInterval(bkPull, 5000);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) bkPull();     // 切回前台/标签页立刻对齐
+  });
   let es;
   try {
     es = new EventSource('/api/backend/events');
+    es.onopen = () => bkPull();         // 重连成功：断线期间的事件已丢，补一次快照
     es.onmessage = (e) => {
       try {
         const m = JSON.parse(e.data);
@@ -2301,19 +2441,18 @@ function initBackendStatus() {
           bkPool = m.backends || [];
           bkEvents = (m.events || []).slice(-1);
         } else if (m.type === 'backend') {
-          bkPool = bkPool.map(p => p.port === m.port ? { ...p, state: m.state } : p);
-          if (!bkPool.length) {           // no snapshot yet — fetch once
-            fetch('/api/backend/status').then(r => r.json()).then(d => {
-              bkPool = d.backends || []; bkEvents = [{ msg: m.msg, state: m.state }]; bkRender();
-            }).catch(() => {});
-          } else {
-            bkEvents = [{ msg: m.msg, state: m.state }];
-          }
+          if (!bkPool.some(p => p.port === m.port)) { bkPull(); return; }  // 池子变了
+          bkPool = bkPool.map(p => p.port === m.port
+            ? { ...p, state: m.state, elapsed: m.state === 'cold' ? null : p.elapsed }
+            : p);
+          bkEvents = [{ msg: m.msg, state: m.state }];
+        } else {
+          return;                        // ping 等保活帧：不改状态
         }
         bkRender();
       } catch(_) {}
     };
-    es.onerror = () => {};   // EventSource 自动重连，无需处理
+    es.onerror = () => { bkPull(); };    // EventSource 会自连；同时立刻补一次
   } catch(_) {}
 }
 
@@ -2584,6 +2723,86 @@ SILENT_RUN_LIMIT = 3        # silent sentences after which an instance is reload
 SILENT_STOP_COOLDOWN = 300  # s — min gap between two silent-triggered reloads
 _silent_run = {}            # port -> consecutive silent sentence count (under _silent_lock)
 _silent_last_stop = {}      # port -> epoch of last silent-triggered reload
+
+
+def _synthesize_batch(texts, voice, speed, model_key=None):
+    """一次请求合成多句（同一种 text_lang），逐句返回 WAV 字节；不可用时 None。
+
+    长文的瓶颈是逐句串行的自回归解码：后端是单进程、请求串行的，一句一请求
+    时 batch_size 再大也只会用到「这一句被切成几段」。把相邻几句拼成一次请求，
+    模型就能在同一批前向里一起解码（实测 4 句 ≈ 逐句耗时的 1/3），而 /tts_batch
+    会把每句的音频单独交回来，点读的时间点一分不差。
+
+    返回逐句 WAV 列表（个别句子静音的位置是 None，调用方只补那几句）；
+    整批不可用时返回 None，调用方全部退回逐句。异常、老后端没有 /tts_batch
+    都走这条退路 —— 批量只可能更快，不会更脆。"""
+    if not texts or len(texts) < 2:
+        return None
+    key = _resolve_model_key(model_key)
+    profile = MODEL_PROFILES[key]
+    v = VOICES.get(voice, VOICES["default"])
+    default_lang = v.get("text_lang", "zh")
+    text_lang = _pick_lang(texts[0], default_lang)
+    if any(_pick_lang(t, default_lang) != text_lang for t in texts):
+        return None                      # 混语言：各句走自己的前端，别硬凑
+    payload = {
+        "texts": list(texts),
+        "text": "",                      # /tts_batch 走 texts 分支，text 仅占位
+        "text_lang": text_lang,
+        "ref_audio_path": v.get("ref_audio_path", ""),
+        "prompt_text": v.get("prompt_text", ""),
+        "prompt_lang": v.get("prompt_lang", "zh"),
+        "speed_factor": speed,
+        "batch_size": len(texts),
+        "top_k": 5,
+        "top_p": 1.0,
+        "temperature": 1.0,
+        "seed": -1,
+        "parallel_infer": True,          # 批量本身就是并行，这里始终开
+        "repetition_penalty": 1.35,
+        "streaming_mode": False,
+    }
+    if profile.get("sample_steps") is not None:
+        payload["sample_steps"] = int(profile["sample_steps"])
+
+    port = _acquire_port(voice, key)
+    try:
+        if not _ensure_backend_hot(port, key):
+            return None
+        r = requests.post(f"http://127.0.0.1:{port}/tts_batch",
+                          json=payload, timeout=600)
+        if r.status_code == 404:
+            logger.info("Backend %s has no /tts_batch — per-sentence fallback", port)
+            return None
+        if r.status_code != 200:
+            logger.warning("Batch synth rejected (%s): %s — per-sentence fallback",
+                           r.status_code, r.text[:160])
+            return None
+        wavs = [base64.b64decode(w) for w in r.json().get("wavs", [])]
+        if len(wavs) != len(texts):
+            logger.warning("Batch synth returned %d wavs for %d texts — fallback",
+                           len(wavs), len(texts))
+            return None
+        # 采样是随机的，一批 8 句里偶尔会有 1-2 句抽到 immediate-EOS（静音）。
+        # 不能因此整批重跑（那是 8 倍的浪费）：把静音的位置标成 None，调用方
+        # 只补那几句。整批失败才返回 None 让全部退回逐句。
+        out = []
+        silent = 0
+        for w in wavs:
+            if _is_silent_wav(w):
+                out.append(None)
+                silent += 1
+            else:
+                out.append(w)
+        if silent:
+            logger.warning("Batch synth: %d/%d item(s) silent — retrying those singly",
+                           silent, len(wavs))
+        return out
+    except Exception as e:
+        logger.warning("Batch synth failed (%s) — per-sentence fallback", e)
+        return None
+    finally:
+        _release_port(port)
 
 
 def _synthesize(text, voice, speed, pad_short=True, model_key=None):

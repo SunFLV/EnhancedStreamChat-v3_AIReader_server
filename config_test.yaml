@@ -1,0 +1,79 @@
+# 隔离测试实例的配置：开在 8010（纯 HTTP），后端指向一个单独起的 9890，
+# 任务缓存写临时目录 —— 跑测试不会碰到线上的 8000 / 9880 / task_cache。
+#   BSAI_CONFIG=config_test.yaml BSAI_TASK_CACHE=/tmp/bsai_task_cache_test \
+#     runtime/python.exe server_intel.py
+server:
+  host: 127.0.0.1
+  port: 8010
+  listeners:
+  - host: 127.0.0.1
+    port: 8010
+backend: http://127.0.0.1:9890
+backend_base_port: 9890
+pool_size: 1
+intel_root: D:\BSAIReader\GPT-SoVITS-For-Intel
+pool_idle_ttl: 0
+pool_evict_grace: 0
+tts:
+  device: xpu
+  is_half: true
+  version: v5turbo
+  t2s_weights_path: GPT_SoVITS/pretrained_models/s1v3.ckpt
+  vits_weights_path: GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2Gv5turbo.pth
+  bert_base_path: GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large
+  cnhuhbert_base_path: GPT_SoVITS/pretrained_models/chinese-hubert-base
+voices:
+- name: v4_default
+  description: 高松灯-叙述 (中文输入)
+  text_lang: zh
+  prompt_lang: ja
+  ref_audio_path: D:/BSAIReader/server/voices/default_ref.mp3
+  prompt_text: そよちゃん、部活でコントラバス、だっけ
+- name: v4_tomori
+  description: 高松灯-开心
+  text_lang: zh
+  prompt_lang: ja
+  ref_audio_path: D:/BSAIReader/server/voices/tomori/ref.wav
+  prompt_text: ありがとう、立希ちゃん
+- name: v4_anon
+  description: 千早爱音-兴奋
+  text_lang: zh
+  prompt_lang: ja
+  ref_audio_path: D:/BSAIReader/server/voices/anon/ref.wav
+  prompt_text: なんて思ったり、よーしライブ成功!みんなで写真撮ってSNSにアップしちゃおう!
+- name: v4_taki
+  description: 椎名立希-军训
+  text_lang: zh
+  prompt_lang: ja
+  ref_audio_path: D:/BSAIReader/server/voices/taki/ref.wav
+  prompt_text: あのお前も全然ダメ人の倍練習して
+- name: v4_rana
+  description: 要乐奈-叙述
+  text_lang: zh
+  prompt_lang: ja
+  ref_audio_path: D:/BSAIReader/server/voices/rana/ref.mp3
+  prompt_text: 楽しかった。お腹すいた。お蕎麦食べたい。
+- name: v4_soyo
+  description: 长崎素世-叙述
+  text_lang: zh
+  prompt_lang: ja
+  ref_audio_path: D:/BSAIReader/server/voices/soyo/ref.wav
+  prompt_text: ありがと。見てないんじゃない私に言われても。
+- name: v4_sunflv
+  description: SunFLV本人音色 (最新训练)
+  text_lang: zh
+  prompt_lang: zh
+  ref_audio_path: D:/BSAIReader/server/voices/sunflv/ref.wav
+  prompt_text: 火海般的恨意让他立于巅峰，却被一滴和50年前同样蓝、同样清澈的水滴浇灭。
+parallel_infer: true
+parallel_batch_size: 8
+default_model: v5turbo
+ports_per_model: 4
+models:
+  v5turbo:
+    version: v5turbo
+    label: v5Turbo / 4 步
+    t2s_weights_path: GPT_SoVITS/pretrained_models/s1v3.ckpt
+    vits_weights_path: GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2Gv5turbo.pth
+    sample_steps: 4
+    is_half: true
