@@ -146,8 +146,17 @@ models:
 #   url 为空字符串 = 同源（相对路径 /api/...），推荐本机用这个；
 #   url 填完整根地址（如 https://other-host:8000）= 前端把请求发到那台机器，
 #   那台机器的 /api/servers 也会出现在列表里（用它自己的配置）。
-# 注意：跨域需要那台机器放行 CORS，且音频/任务ID在那台机器上。
+# 前端不直连远端：所有请求都带 _srv=<下标> 发到本机，由本机转发过去
+# （跨域、混合内容都不再是问题；Range 与 SSE 会原样透传）。
+# 远端连不上时返回 502 并给出原因。
+# 转发到自签名 https 的远端时要不要校验证书。内网/自签一般关掉；
+# 如果远端是正规证书，改成 true 更安全。
+forward_tls_verify: false
+
 servers:
   - name: "本机 A770"
     url: ""
     desc: "这台机器（同源）"
+  - name: "9070XT (streaming6)"
+    url: "http://streaming6.sunflv.top:9881"
+    desc: "纯池 API（cuda×4），需另有代理层"

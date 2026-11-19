@@ -1375,6 +1375,107 @@ app.add_middleware(
 )
 
 
+# ── 反向转发：前端只连本机，其它服务器由本机代理 ──────────────────
+# 浏览器直连远端会撞两堵墙：跨域（CORS）和混合内容（https 页面里发 http 请求）。
+# 所以改成「前端永远只发同源请求，带一个 _srv=<下标> 说明要哪台」，由本服务
+# 把请求转发过去、把响应原样流回来 —— 音频、Range 拖动、SSE 进度都不受影响。
+import httpx as _httpx
+from urllib.parse import urlencode as _urlencode
+
+_forward_client = None
+
+
+def _forward_tls_verify():
+    return bool(config.get("forward_tls_verify", False))
+
+
+def _selected_remote(request):
+    """从 _srv（查询参数，音频/EventSource 也能带）或 X-BSAI-Server 取出目标机器的根地址。
+
+    _srv 支持下标（0 = 本机）或服务器名；指向本机/空 url 时返回 None（不转发）。
+    """
+    raw = request.query_params.get("_srv") or request.headers.get("x-bsai-server")
+    if raw in (None, "", "0", "local"):
+        return None
+    servers = [s for s in (config.get("servers") or [])
+               if isinstance(s, dict) and s.get("name")]
+    picked = None
+    if str(raw).isdigit():
+        i = int(raw)
+        picked = servers[i] if 0 <= i < len(servers) else None
+    else:
+        picked = next((s for s in servers if s.get("name") == raw), None)
+    url = str((picked or {}).get("url") or "").rstrip("/")
+    return (url, picked.get("name")) if url else None
+
+
+# 这些路径永远由本机处理：服务器列表、健康检查、网页本身
+_NO_FORWARD = ("/api/servers", "/api/health")
+
+
+@app.middleware("http")
+async def _forward_to_selected_server(request: Request, call_next):
+    global _forward_client
+    path = request.url.path
+    if not path.startswith("/api/") or path in _NO_FORWARD:
+        return await call_next(request)
+
+    target = _selected_remote(request)
+    if not target:
+        return await call_next(request)
+    base, name = target
+
+    # 组装转发 URL：去掉 _srv（否则远端会再解释一次），其余查询参数原样带上
+    q = [(k, v) for k, v in request.query_params.multi_items() if k != "_srv"]
+    url = base + path + (("?" + _urlencode(q)) if q else "")
+
+    body = await request.body()
+    # 只挑必要的头：Accept-Encoding 固定 identity，免得 gzip 后 Content-Length 对不上
+    fwd_headers = {"accept-encoding": "identity"}
+    for k in ("content-type", "accept", "range", "if-range",
+              "if-none-match", "if-modified-since"):
+        v = request.headers.get(k)
+        if v:
+            fwd_headers[k] = v
+
+    if _forward_client is None:
+        _forward_client = _httpx.AsyncClient(
+            verify=_forward_tls_verify(),
+            timeout=_httpx.Timeout(connect=10.0, read=None, write=None, pool=None),
+            follow_redirects=False,
+        )
+
+    try:
+        # 一定要 send(stream=True)：整章音频可能几百 MB，不能先读进内存
+        up_req = _forward_client.build_request(
+            request.method, url, headers=fwd_headers,
+            content=body if body else None,
+        )
+        upstream = await _forward_client.send(up_req, stream=True)
+    except _httpx.HTTPError as e:
+        logger.warning("Forward to %s (%s) failed: %s", name, url, e)
+        return JSONResponse(status_code=502, content={
+            "message": f"无法连接服务器「{name}」",
+            "detail": f"{type(e).__name__}: {e}",
+            "url": url,
+        })
+
+    # 只透传语义相关的头；Content-Length 保留（identity 编码下仍然准确）
+    keep = ("content-type", "content-length", "content-range", "accept-ranges",
+            "cache-control", "last-modified", "etag", "content-disposition")
+    resp_headers = {k: v for k, v in upstream.headers.items() if k.lower() in keep}
+
+    async def _stream():
+        try:
+            async for chunk in upstream.aiter_raw():
+                yield chunk
+        finally:
+            await upstream.aclose()
+
+    return StreamingResponse(_stream(), status_code=upstream.status_code,
+                             headers=resp_headers)
+
+
 # ── Web UI ───────────────────────────────────────────────────────
 WEB_HTML = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1680,11 +1781,17 @@ const longBtn = $('longBtn');
 
 // ── 服务器选择 ───────────────────────────────────────────────
 // 下拉项来自当前服务的 /api/servers（由 config_intel.yaml 的 servers: 驱动）。
-// srvBase = '' 表示同源相对路径；选中别的机器时是那台的根地址。
-let srvBase = '';
+// 请求**永远发本机**（同源相对路径），用 _srv=<下标> 告诉服务端转发到哪台 ——
+// 这样跨域（CORS）和 https 页面里发 http 请求（混合内容）都不会发生。
+let srvBase = '';        // 仅用于界面显示，不再拼进请求地址
+let srvIdx = 0;
 let serverList = [];
-// 所有 API/音频请求统一走这里：改一次服务器，全站请求跟着走。
-function api(path) { return srvBase + path; }
+// 所有 API/音频/事件流统一走这里：改一次服务器，全站请求跟着走。
+function api(path) {
+  const s = serverList[srvIdx];
+  if (!s || !s.url) return path;                 // 本机：原样
+  return path + (path.includes('?') ? '&' : '?') + '_srv=' + srvIdx;
+}
 
 async function loadServers() {
   const sel = $('serverPick');
@@ -1693,8 +1800,16 @@ async function loadServers() {
     const r = await fetch('/api/servers', { cache: 'no-store' });
     const data = await r.json();
     serverList = data.servers || [];
+    // 每台后面标出探测结果：能不能直接切过去用，一眼可见
+    const badge = s => {
+      if (!s.kind || s.kind === 'local') return '';
+      if (s.kind === 'proxy') return ` ✓ ${s.detail || ''}`;
+      if (s.kind === 'pool')  return ` ⚠ 仅池 API${s.detail ? ' · ' + s.detail : ''}`;
+      if (s.kind === 'offline') return ` ✕ 不可达`;
+      return ` · ${s.detail || s.kind}`;
+    };
     sel.innerHTML = serverList.map((s, i) =>
-      `<option value="${i}">${s.name}${s.desc ? ' — ' + s.desc : ''}</option>`).join('');
+      `<option value="${i}">${s.name}${s.desc ? ' — ' + s.desc : ''}${badge(s)}</option>`).join('');
     // 记住上次选择；配置改过导致下标失效时退回第一台
     const saved = localStorage.getItem('bsai.server');
     const idx = saved !== null && saved < serverList.length ? Number(saved) : 0;
@@ -1709,7 +1824,13 @@ async function loadServers() {
 
 function applyServer(idx, initial) {
   const s = serverList[idx] || { url: '' };
-  srvBase = String(s.url || '').replace(/\/+$/, '');   // 去掉结尾斜杠，避免 //
+  // 请求都走本机转发，唯一还需要提前提示的是「本机连不上那台」
+  if (!initial && s.url && s.kind === 'offline') {
+    status.textContent = `⚠ ${s.name} 探测不到（${s.detail || '连接失败'}），`
+      + `合成请求会返回 502。检查地址/服务是否启动。`;
+  }
+  srvIdx = idx;
+  srvBase = String(s.url || '').replace(/\/+$/, '');   // 只用于显示
   localStorage.setItem('bsai.server', String(idx));
   if (!initial) {
     // 用户主动切换 = 换了一个后端：停播、重拉音色、重建事件流
@@ -1721,10 +1842,11 @@ function applyServer(idx, initial) {
 }
 
 async function loadVoices() {
-  // 音色和模型版本都是「每台服务器各自」的：切到远端时这里会跨源去读那台的
-  // /api/voices（服务端已开 CORS）。拿不到就把选择器锁掉并说明原因，
+  // 音色和模型版本都是「每台服务器各自」的：请求照样发本机，由本机转发到
+  // 选中的那台（带 _srv）。拿不到就把选择器锁掉并说明原因，
   // 免得用户以为还能用本地那套模型。
-  const where = srvBase ? srvBase : '本机';
+  const picked = serverList[srvIdx];
+  const where = (picked && picked.name) || '本机';
   voiceLong.innerHTML = '<option>加载中…</option>';
   versionLong.innerHTML = '<option>加载中…</option>';
   try {
@@ -2779,21 +2901,84 @@ async def backend_events_sse():
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
+_SRV_PROBE_CACHE = {}      # url -> (ts, kind, detail)
+_SRV_PROBE_TTL = 60.0      # 秒；别让下拉框每次都去打远端
+
+
+def _probe_server(url):
+    """这台远端到底是什么：能当代理用（有 /api/voices），还是只有池 API。
+
+    返回 (kind, detail)：
+      proxy   —— 有 /api/voices，前端切过去功能完整
+      pool    —— 只有 /tts_batch 之类的纯后端池，没有音色/长文/点读
+      offline —— 连不上
+      http    —— 是 http 而本页是 https，浏览器会按混合内容拦截（前端要提示）
+    """
+    import time as _t
+    now = _t.time()
+    hit = _SRV_PROBE_CACHE.get(url)
+    if hit and now - hit[0] < _SRV_PROBE_TTL:
+        return hit[1], hit[2]
+    kind, detail = "offline", ""
+    try:
+        r = requests.get(url.rstrip("/") + "/api/voices", timeout=2.0)
+        if r.status_code == 200:
+            kind = "proxy"
+            try:
+                d = r.json()
+                detail = f"{len(d.get('versions') or [])} 个模型"
+            except Exception:
+                detail = ""
+        else:
+            # 不是代理，看是不是池 API
+            try:
+                h = requests.get(url.rstrip("/") + "/health", timeout=2.0)
+                j = h.json() if h.status_code == 200 else {}
+                if isinstance(j, dict) and "pool_size" in j:
+                    kind = "pool"
+                    detail = f"{j.get('pool_size')} 实例 / {','.join(j.get('devices') or [])}"
+                elif h.status_code == 200:
+                    kind = "other"
+                    detail = f"HTTP {h.status_code}"
+                else:
+                    kind = "offline"
+                    detail = f"HTTP {r.status_code}"
+            except Exception as e:
+                kind, detail = "offline", str(e)[:60]
+    except Exception as e:
+        kind, detail = "offline", str(e)[:60]
+    _SRV_PROBE_CACHE[url] = (now, kind, detail)
+    return kind, detail
+
+
 @app.get("/api/servers")
 async def servers():
     """前端服务器下拉框的数据源 —— 完全由 config_intel.yaml 的 servers: 驱动。
 
     url 为空 = 同源相对路径（本机）；填完整根地址 = 前端把请求发到那台机器。
-    这样加机器只改配置、不用动前端代码。"""
-    out = []
-    for s in config.get("servers") or []:
-        if not isinstance(s, dict) or not s.get("name"):
-            continue
-        out.append({"name": s["name"], "url": s.get("url", ""),
-                    "desc": s.get("desc", "")})
-    if not out:                       # 配置没写时至少给一个同源选项，前端不至于空着
-        out = [{"name": "本机", "url": "", "desc": "同源"}]
-    return {"servers": out, "current": out[0]["name"]}
+    每台都会探测一次（60 s 缓存），告诉前端它到底是「完整代理」还是「纯池 API」，
+    以及会不会被浏览器的混合内容策略拦掉 —— 免得切过去才发现用不了。
+    """
+    import asyncio as _aio
+    raw = [s for s in (config.get("servers") or [])
+           if isinstance(s, dict) and s.get("name")]
+    if not raw:
+        raw = [{"name": "本机", "url": "", "desc": "同源"}]
+
+    async def one(s):
+        url = str(s.get("url") or "")
+        item = {"name": s["name"], "url": url, "desc": s.get("desc", "")}
+        if not url:
+            item.update(kind="local", detail="同源", mixed_content=False)
+            return item
+        kind, detail = await _aio.to_thread(_probe_server, url)
+        item.update(kind=kind, detail=detail,
+                    # 页面走 https 时，http:// 的远端会被浏览器直接拒绝
+                    mixed_content=url.startswith("http://"))
+        return item
+
+    out = await _aio.gather(*[one(s) for s in raw])
+    return {"servers": list(out), "current": out[0]["name"]}
 
 
 @app.get("/api/voices")

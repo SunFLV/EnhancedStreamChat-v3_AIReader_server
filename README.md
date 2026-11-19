@@ -204,16 +204,29 @@ starts[k] = sum(durations[:k])
 ### 🖥 多服务器与模型能力
 
 前端顶栏的服务器下拉由 `config_intel.yaml` 的 `servers:` 驱动，每台机器的
-**音色与模型版本各自独立** —— 切过去后前端跨源读那台的 `/api/voices`（服务端已开
-CORS）。加机器只改配置：
+**音色与模型版本各自独立**。加机器只改配置：
 
 ```yaml
 servers:
   - name: "本机 A770"
     url: ""                        # 空 = 同源
   - name: "9070XT"
-    url: "https://other:8000"
+    url: "http://other:8000"       # 内网 http 也行
+forward_tls_verify: false          # 转发到自签名 https 时用（默认就关）
 ```
+
+**所有请求都由本机服务端转发**，浏览器只跟本机说话：
+
+```
+浏览器 ──/api/voices?_srv=1──▶ 本机代理 ──/api/voices──▶ 9070XT
+```
+
+- 前端所有请求（含 `<audio src>`、EventSource）都发同源，带 `_srv=<下标>`
+  （也可用请求头 `X-BSAI-Server`），由本机中间件转发到那台并流式回传
+- 因此**不再有跨域，也不会有 https 页面里发 http 请求被浏览器拦掉的混合内容问题**
+- `Range` 原样透传，几百 MB 的整章音频拖动进度条照常工作（实测返回 206 且字节一致）
+- `/api/servers`、`/api/health` 永远由本机处理，不参与转发
+- 远端连不上时返回 `502` 并带上原因，前端会提示「无法连接服务器「xxx」」
 
 **模型列表不是写死的**：服务端启动时会读
 

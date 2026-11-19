@@ -1,7 +1,3 @@
-# 隔离测试实例的配置：开在 8010（纯 HTTP），后端指向一个单独起的 9890，
-# 任务缓存写临时目录 —— 跑测试不会碰到线上的 8000 / 9880 / task_cache。
-#   BSAI_CONFIG=config_test.yaml BSAI_TASK_CACHE=/tmp/bsai_task_cache_test \
-#     runtime/python.exe server_intel.py
 server:
   host: 127.0.0.1
   port: 8010
@@ -78,3 +74,10 @@ models:
     vits_weights_path: GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2Gv5turbo.pth
     sample_steps: 4
     is_half: true
+servers:
+- name: 本机(测试 8010)
+  url: ''
+  desc: 同源
+- name: 线上 8000
+  url: https://127.0.0.1:8000
+  desc: 转发测试目标
