@@ -1803,8 +1803,9 @@ async function loadServers() {
     // 每台后面标出探测结果：能不能直接切过去用，一眼可见
     const badge = s => {
       if (!s.kind || s.kind === 'local') return '';
-      if (s.kind === 'proxy') return ` ✓ ${s.detail || ''}`;
-      if (s.kind === 'pool')  return ` ⚠ 仅池 API${s.detail ? ' · ' + s.detail : ''}`;
+      if (s.kind === 'proxy')   return ` ✓ ${s.detail || ''}`;
+      if (s.kind === 'backend') return ` ⚠ 仅合成接口${s.detail ? ' · ' + s.detail : ''}`;
+      if (s.kind === 'pool')    return ` ⚠ 仅池 API${s.detail ? ' · ' + s.detail : ''}`;
       if (s.kind === 'offline') return ` ✕ 不可达`;
       return ` · ${s.detail || s.kind}`;
     };
@@ -1824,10 +1825,15 @@ async function loadServers() {
 
 function applyServer(idx, initial) {
   const s = serverList[idx] || { url: '' };
-  // 请求都走本机转发，唯一还需要提前提示的是「本机连不上那台」
-  if (!initial && s.url && s.kind === 'offline') {
-    status.textContent = `⚠ ${s.name} 探测不到（${s.detail || '连接失败'}），`
-      + `合成请求会返回 502。检查地址/服务是否启动。`;
+  // 请求都走本机转发，所以这里提示的是「选中这台之后哪些功能用不了」
+  if (!initial && s.url) {
+    if (s.kind === 'offline') {
+      status.textContent = `⚠ ${s.name} 探测不到（${s.detail || '连接失败'}），`
+        + `请求会返回 502。检查地址/服务是否启动。`;
+    } else if (s.kind === 'backend' || s.kind === 'pool') {
+      status.textContent = `ℹ 已切到 ${s.name}：合成由它完成，但它没有长文任务与点读接口`
+        + `（要完整功能需在那台部署 bsai 附加包）。`;
+    }
   }
   srvIdx = idx;
   srvBase = String(s.url || '').replace(/\/+$/, '');   // 只用于显示
@@ -2906,13 +2912,14 @@ _SRV_PROBE_TTL = 60.0      # 秒；别让下拉框每次都去打远端
 
 
 def _probe_server(url):
-    """这台远端到底是什么：能当代理用（有 /api/voices），还是只有池 API。
+    """这台远端能承担到什么程度。前端请求都由本机转发，所以这里只看「对端有什么接口」。
 
     返回 (kind, detail)：
-      proxy   —— 有 /api/voices，前端切过去功能完整
-      pool    —— 只有 /tts_batch 之类的纯后端池，没有音色/长文/点读
+      proxy   —— 有 /api/servers：完整的 bsai 代理，音色/长文/点读全都有
+      backend —— 有 /api/voices 但没有 /api/servers：装了我们补丁的后端/池服务，
+                 能自报模型与音色、能合成，但没有长文任务与点读
+      pool    —— 只有 /tts_batch 之类的纯池 API
       offline —— 连不上
-      http    —— 是 http 而本页是 https，浏览器会按混合内容拦截（前端要提示）
     """
     import time as _t
     now = _t.time()
@@ -2920,13 +2927,29 @@ def _probe_server(url):
     if hit and now - hit[0] < _SRV_PROBE_TTL:
         return hit[1], hit[2]
     kind, detail = "offline", ""
+    base = url.rstrip("/")
     try:
-        r = requests.get(url.rstrip("/") + "/api/voices", timeout=2.0)
-        if r.status_code == 200:
+        # 先看是不是完整代理（只有它才有 /api/servers）
+        try:
+            sr = requests.get(base + "/api/servers", timeout=2.0)
+        except Exception:
+            sr = None
+        if sr is not None and sr.status_code == 200:
             kind = "proxy"
             try:
+                d = sr.json()
+                detail = f"{len(d.get('servers') or [])} 台互联"
+            except Exception:
+                detail = ""
+            _SRV_PROBE_CACHE[url] = (now, kind, detail)
+            return kind, detail
+
+        r = requests.get(base + "/api/voices", timeout=2.0)
+        if r.status_code == 200:
+            kind = "backend"
+            try:
                 d = r.json()
-                detail = f"{len(d.get('versions') or [])} 个模型"
+                detail = f"{len(d.get('versions') or [])} 个模型 / {len(d.get('voices') or [])} 音色"
             except Exception:
                 detail = ""
         else:
