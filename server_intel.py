@@ -29,11 +29,30 @@ logger = logging.getLogger("tts-proxy")
 
 # ── Config ───────────────────────────────────────────────────────
 SCRIPT_DIR = Path(__file__).parent.absolute()
+# 独立附加包模式：解压到后端根目录后，后端就是 SCRIPT_DIR 的父目录。
+# BSAI_BACKEND_DIR 可显式覆盖；不设时按「父目录有 runtime/python.exe + api_v2.py」
+# 自动判断。这样同一份代码既能放在 server/ 下用，也能整包丢进后端根目录。
+def _detect_backend_dir(base):
+    for cand in (os.environ.get("BSAI_BACKEND_DIR"), str(base.parent), str(base)):
+        if not cand:
+            continue
+        p = Path(cand)
+        if (p / "runtime" / "python.exe").exists() and (p / "api_v2.py").exists():
+            return str(p)
+    return None
+
+BACKEND_DIR = _detect_backend_dir(SCRIPT_DIR)
 # BSAI_CONFIG 可指向另一份配置：便于开一个「不影响线上」的测试实例
 # （不同监听端口 + 不同 backend_base_port，共用同一套代码）。
 CONFIG_PATH = Path(os.environ.get("BSAI_CONFIG") or (SCRIPT_DIR / "config_intel.yaml"))
 with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-    config = yaml.safe_load(f)
+    _config_text = f.read()
+# 配置里的 {BACKEND_DIR} / {ADDON_DIR} 占位符在加载时展开 —— 换机器只需解压，
+# 不用改一整份绝对路径。BACKEND_DIR 未探测到时留空串，配置可自行写绝对路径。
+_config_text = (_config_text
+                .replace("{BACKEND_DIR}", (BACKEND_DIR or "").replace("\\", "/"))
+                .replace("{ADDON_DIR}", str(SCRIPT_DIR).replace("\\", "/")))
+config = yaml.safe_load(_config_text)
 
 BACKEND = config.get("backend", "http://127.0.0.1:9880")
 POOL_SIZE = config.get("pool_size", 1)
@@ -52,7 +71,9 @@ BACKEND_BASE_PORT = config.get("backend_base_port", 9880)
 import subprocess
 import threading
 import time
-INTEL_ROOT = config.get("intel_root", r"D:\BSAIReader\GPT-SoVITS-For-Intel")
+INTEL_ROOT = (config.get("intel_root") or BACKEND_DIR
+              or r"D:\BSAIReader\GPT-SoVITS-For-Intel")
+INTEL_ROOT = os.path.normpath(INTEL_ROOT)
 
 # ── Model profiles: one backend config per selectable version ─────
 # The frontend sends a `version`; each profile gets its own generated
@@ -1444,6 +1465,10 @@ input[type=file] { width:100%; font-size:12.5px; color:#aaa; margin-top:4px; }
 input[type=color] { width:38px; height:26px; padding:0; border:none; background:none;
                     cursor:pointer; vertical-align:middle; }
 .bk-label { color:#888; white-space:nowrap; font-size:12.5px; }
+/* 服务器选择器（下拉项由后端 /api/servers 提供，配置驱动） */
+.srv-wrap { display:inline-flex; align-items:center; gap:5px; white-space:nowrap;
+            font-size:12.5px; color:#aaa; }
+#serverPick { max-width:150px; padding:4px 8px; font-size:12.5px; cursor:pointer; }
 #bkChips { display:inline-flex; gap:8px; flex-wrap:wrap; }
 .bk-chip {
   display:inline-flex; align-items:center; gap:6px; padding:3px 10px;
@@ -1469,6 +1494,9 @@ input[type=color] { width:38px; height:26px; padding:0; border:none; background:
       <button class="tab-btn" id="tabRead">点读</button>
     </div>
     <span class="spacer"></span>
+    <label class="srv-wrap" title="切换 TTS 服务器（列表来自服务端配置）">
+      🖥 <select id="serverPick"></select>
+    </label>
     <!-- 后端引擎实时状态（SSE 推送：启动 / 加载 N s / 就绪 / 空闲卸载） -->
     <span class="bk-label">⚙</span>
     <span id="bkChips"></span>
@@ -1581,9 +1609,51 @@ const voiceLong = $('voiceLong');
 const versionLong = $('versionLong');
 const longBtn = $('longBtn');
 
+// ── 服务器选择 ───────────────────────────────────────────────
+// 下拉项来自当前服务的 /api/servers（由 config_intel.yaml 的 servers: 驱动）。
+// srvBase = '' 表示同源相对路径；选中别的机器时是那台的根地址。
+let srvBase = '';
+let serverList = [];
+// 所有 API/音频请求统一走这里：改一次服务器，全站请求跟着走。
+function api(path) { return srvBase + path; }
+
+async function loadServers() {
+  const sel = $('serverPick');
+  try {
+    // 服务器列表永远从「当前页面所在的那台」拿，不然切成远端后会拿到远端的列表
+    const r = await fetch('/api/servers', { cache: 'no-store' });
+    const data = await r.json();
+    serverList = data.servers || [];
+    sel.innerHTML = serverList.map((s, i) =>
+      `<option value="${i}">${s.name}${s.desc ? ' — ' + s.desc : ''}</option>`).join('');
+    // 记住上次选择；配置改过导致下标失效时退回第一台
+    const saved = localStorage.getItem('bsai.server');
+    const idx = saved !== null && saved < serverList.length ? Number(saved) : 0;
+    sel.value = String(idx);
+    applyServer(idx, true);          // 首次：只设 base，不动播放器
+  } catch(e) {
+    sel.innerHTML = '<option value="0">本机</option>';
+    applyServer(0, true);
+  }
+  sel.onchange = () => applyServer(Number(sel.value), false);
+}
+
+function applyServer(idx, initial) {
+  const s = serverList[idx] || { url: '' };
+  srvBase = String(s.url || '').replace(/\/+$/, '');   // 去掉结尾斜杠，避免 //
+  localStorage.setItem('bsai.server', String(idx));
+  if (!initial) {
+    // 用户主动切换 = 换了一个后端：停播、重拉音色、重建事件流
+    try { audio.pause(); } catch(_) {}
+    player.style.display = 'none';
+    if (typeof initBackendStatus === 'function') initBackendStatus();
+  }
+  loadVoices();
+}
+
 async function loadVoices() {
   try {
-    const r = await fetch('/api/voices');
+    const r = await fetch(api('/api/voices'));
     const data = await r.json();
     const opts = data.voices.map(v =>
       `<option value="${v.name}">${v.name} — ${v.description || ''}</option>`).join('');
@@ -1640,7 +1710,7 @@ async function pollTick(taskId) {
   if (pollTaskId !== taskId) return;      // 已换成别的任务 / 已收尾
   let p;
   try {
-    const r = await fetch(`/api/tts/progress/${taskId}`, { cache: 'no-store' });
+    const r = await fetch(api(`/api/tts/progress/${taskId}`), { cache: 'no-store' });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     p = await r.json();
   } catch(e) {
@@ -1670,7 +1740,7 @@ async function pollTick(taskId) {
     if (partialMode) { upgradeToFinal(); return; }
     // No auto-play: a chapter can run for hours. The player is pointed at
     // the result (Range-enabled, so seeking works) and 点读 drives it.
-    audio.src = `/api/tts/result/${taskId}`;
+    audio.src = api(`/api/tts/result/${taskId}`);
     audio.volume = 1.0;
     player.style.display = 'block';
     await loadReader(taskId);
@@ -1738,7 +1808,7 @@ $('longBtn').onclick = async () => {
   longBtn.disabled = true;
   showProgress(1, '正在提交任务…');
   try {
-    const r = await fetch('/api/tts/long', {
+    const r = await fetch(api('/api/tts/long'), {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify({
@@ -1802,8 +1872,8 @@ function fmtTime(s) {
 }
 
 function setDownloads(taskId) {
-  $('dlFull').href = `/api/tts/result/${taskId}`;
-  $('dlSplit').href = `/api/tts/split/${taskId}`;
+  $('dlFull').href = api(`/api/tts/result/${taskId}`);
+  $('dlSplit').href = api(`/api/tts/split/${taskId}`);
   // Named after the server's own files, so a downloaded pair re-uploads as-is.
   $('dlFull').download = `${taskId}.wav`;
   $('dlSplit').download = `${taskId}.json`;
@@ -1822,14 +1892,14 @@ function pageOfSentence(i) {
 // 服务端 /api/tts/partial 给的是已完成片段的拼接（与最终整章音频逐样本一致），
 // 所以合成推进 / 完成时只需换 URL 并保留 currentTime，时间点一个都不用改。
 function partialAudioUrl(taskId, done) {
-  return `/api/tts/partial/${taskId}/audio?v=${done || 0}`;
+  return api(`/api/tts/partial/${taskId}/audio?v=${done || 0}`);
 }
 
 // 当前该绑定的音频：partial 任务用前缀，否则用最终整章音频。
 function audioUrl() {
   return partialMode
     ? partialAudioUrl(currentTaskId, splitDoc ? (splitDoc.ready || 0) : 0)
-    : `/api/tts/result/${currentTaskId}`;
+    : api(`/api/tts/result/${currentTaskId}`);
 }
 
 // 现在可以点的句子数：partial 任务里只有已合成部分是目标音频的一部分。
@@ -1864,7 +1934,7 @@ async function refreshPartial() {
   const at = audio.currentTime, playing = !audio.paused;
   let doc;
   try {
-    const r = await fetch(`/api/tts/partial/${currentTaskId}`);
+    const r = await fetch(api(`/api/tts/partial/${currentTaskId}`));
     if (!r.ok) return;
     doc = await r.json();
   } catch(_) { return; }             // 下一轮轮询再试
@@ -1897,7 +1967,7 @@ function upgradeToFinal() {
     splitDoc.ready = sentenceCount();
   }
   setDownloadsEnabled(true);
-  audio.src = `/api/tts/result/${currentTaskId}`;
+  audio.src = api(`/api/tts/result/${currentTaskId}`);
   audio.onloadedmetadata = () => {
     audio.currentTime = at;
     if (playing) audio.play().catch(() => {});
@@ -2137,7 +2207,7 @@ async function loadReader(taskId) {
   try {
     // 合成中的任务也能读：这个端点给已就绪句子的前缀音频与时间点，完成后
     // 与 /api/tts/split 返回同一份最终文档。
-    const r = await fetch(`/api/tts/partial/${taskId}`);
+    const r = await fetch(api(`/api/tts/partial/${taskId}`));
     if (!r.ok) throw new Error(await r.text());
     await showDoc(await r.json());
     return true;
@@ -2430,7 +2500,7 @@ $('importBtn').onclick = async () => {
     const fd = new FormData();
     fd.append('split', splitFile);
     if (audioFile) fd.append('audio', audioFile);
-    const r = await fetch('/api/tts/import', { method: 'POST', body: fd });
+    const r = await fetch(api('/api/tts/import'), { method: 'POST', body: fd });
     const d = await r.json();
     if (!r.ok) throw new Error(d.detail || '上传失败');
     showTaskInfo(d.task_id);
@@ -2493,13 +2563,14 @@ function bkRender() {
 function bkPull() {
   if (bkPulling) return;
   bkPulling = true;
-  fetch('/api/backend/status', { cache: 'no-store' })
+  fetch(api('/api/backend/status'), { cache: 'no-store' })
     .then(r => r.json())
     .then(d => { bkPool = d.backends || []; bkEvents = (d.events || []).slice(-1); bkRender(); })
     .catch(() => {})
     .then(() => { bkPulling = false; });
 }
 
+let bkEventSource = null;
 function initBackendStatus() {
   bkPull();
   // 兜底轮询：状态条 5 s 对齐一次（也让「加载中 N s」跟着走）
@@ -2507,9 +2578,9 @@ function initBackendStatus() {
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) bkPull();     // 切回前台/标签页立刻对齐
   });
-  let es;
   try {
-    es = new EventSource('/api/backend/events');
+    if (bkEventSource) bkEventSource.close();   // 切服务器时先断旧连接
+    const es = bkEventSource = new EventSource(api('/api/backend/events'));
     es.onopen = () => bkPull();         // 重连成功：断线期间的事件已丢，补一次快照
     es.onmessage = (e) => {
       try {
@@ -2548,7 +2619,7 @@ function initBackendStatus() {
 initBackendStatus();
 buildSwatches();
 applyAppearance();
-loadVoices();
+loadServers();   // 读 /api/servers → 渲染下拉 → applyServer() 里会调 loadVoices()
 </script>
 </body>
 </html>
@@ -2621,6 +2692,23 @@ async def backend_events_sse():
                     pass
 
     return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.get("/api/servers")
+async def servers():
+    """前端服务器下拉框的数据源 —— 完全由 config_intel.yaml 的 servers: 驱动。
+
+    url 为空 = 同源相对路径（本机）；填完整根地址 = 前端把请求发到那台机器。
+    这样加机器只改配置、不用动前端代码。"""
+    out = []
+    for s in config.get("servers") or []:
+        if not isinstance(s, dict) or not s.get("name"):
+            continue
+        out.append({"name": s["name"], "url": s.get("url", ""),
+                    "desc": s.get("desc", "")})
+    if not out:                       # 配置没写时至少给一个同源选项，前端不至于空着
+        out = [{"name": "本机", "url": "", "desc": "同源"}]
+    return {"servers": out, "current": out[0]["name"]}
 
 
 @app.get("/api/voices")

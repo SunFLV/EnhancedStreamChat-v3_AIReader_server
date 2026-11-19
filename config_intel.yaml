@@ -140,3 +140,14 @@ models:
     vits_weights_path: "GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2Gv5turbo.pth"
     sample_steps: 4
     is_half: true
+
+# ── 前端可选的 TTS 服务器 ──────────────────────────────────────
+# 前端下拉框直接读 /api/servers，按这个列表渲染。
+#   url 为空字符串 = 同源（相对路径 /api/...），推荐本机用这个；
+#   url 填完整根地址（如 https://other-host:8000）= 前端把请求发到那台机器，
+#   那台机器的 /api/servers 也会出现在列表里（用它自己的配置）。
+# 注意：跨域需要那台机器放行 CORS，且音频/任务ID在那台机器上。
+servers:
+  - name: "本机 A770"
+    url: ""
+    desc: "这台机器（同源）"
