@@ -97,6 +97,62 @@ if not MODEL_PROFILES:
 MODEL_KEYS = list(MODEL_PROFILES.keys())
 if DEFAULT_MODEL not in MODEL_PROFILES:
     DEFAULT_MODEL = MODEL_KEYS[0]
+
+
+def _probe_backend_capabilities():
+    """这台机器上的后端**实际**支持哪些版本 —— 不信配置，信后端自己。
+
+    两个来源，取交集：
+      1. Patcher 应用补丁后写的 `BSAI_PATCH.json`（machine-readable 能力清单，
+         未来补丁只装 v4 就会写 v4，服务端据此不再对外宣称 v5turbo）；
+      2. 后端 `GPT_SoVITS/configs/tts_infer.yaml` 里真实存在的版本段
+         （v1/v2/v3/v4/v5turbo/v5dev），旧版后端没有 v5 段就不会被点亮。
+
+    两个来源都没有时返回 None（= 不限制，按配置来），保持向后兼容。
+    """
+    try:
+        root = Path(INTEL_ROOT)
+    except Exception:
+        return None
+    declared = None
+    patch_json = root / "BSAI_PATCH.json"
+    if patch_json.exists():
+        try:
+            j = json.loads(patch_json.read_text(encoding="utf-8"))
+            v = j.get("models") or j.get("versions")
+            if isinstance(v, list) and v:
+                declared = [str(x) for x in v]
+        except Exception as e:
+            logger.warning("BSAI_PATCH.json unreadable: %s", e)
+
+    segments = None
+    infer_yaml = root / "GPT_SoVITS" / "configs" / "tts_infer.yaml"
+    if infer_yaml.exists():
+        try:
+            y = yaml.safe_load(infer_yaml.read_text(encoding="utf-8")) or {}
+            known = {"v1", "v2", "v3", "v4", "v5turbo", "v5dev"}
+            segments = [k for k in y.keys() if str(k) in known]
+        except Exception as e:
+            logger.warning("tts_infer.yaml unreadable: %s", e)
+
+    if declared and segments:
+        return [v for v in declared if v in segments] or None
+    return declared or segments or None
+
+
+BACKEND_CAPS = _probe_backend_capabilities()
+if BACKEND_CAPS:
+    _supported = set(BACKEND_CAPS)
+    _kept = {k: v for k, v in MODEL_PROFILES.items()
+             if str(v.get("version") or k) in _supported}
+    if _kept:
+        MODEL_PROFILES = _kept
+        MODEL_KEYS = list(MODEL_PROFILES.keys())
+        if DEFAULT_MODEL not in MODEL_PROFILES:
+            DEFAULT_MODEL = MODEL_KEYS[0]
+    else:
+        logger.warning("后端声明的版本 %s 与本机配置 %s 无交集 —— 按配置继续，"
+                       "但合成很可能失败，请检查补丁安装", BACKEND_CAPS, list(MODEL_KEYS))
 # ── 并行推理开关：决定实例池策略 ────────────────────────────────
 # parallel_infer=true (默认): 强制单实例 —— 无论请求什么版本，都只用默认模型
 #   的 1 个实例，靠 api_v2 的 /tts_batch 把多句拼成一次前向一起解码。
@@ -1305,6 +1361,19 @@ def _run_long_task(task_id, text, voice, speed, model_key=None):
 # ── FastAPI ──────────────────────────────────────────────────────
 app = FastAPI(title="AI TTS Proxy", version="3.0.0")
 
+# 跨源：前端「服务器选择」会直接去目标机器的 /api/* 读它支持的模型/音色。
+# 没有这层头，浏览器会拦掉跨域读，前端只能看到「加载失败」。
+# 只放开 /api/*（网页本身还是同源），并且允许带凭证以外的普通 GET/POST。
+from fastapi.middleware.cors import CORSMiddleware as _CORSMiddleware
+app.add_middleware(
+    _CORSMiddleware,
+    allow_origins=["*"],              # TTS 服务是自用/内网，允许任意来源读
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=600,
+)
+
 
 # ── Web UI ───────────────────────────────────────────────────────
 WEB_HTML = """<!DOCTYPE html>
@@ -1652,19 +1721,35 @@ function applyServer(idx, initial) {
 }
 
 async function loadVoices() {
+  // 音色和模型版本都是「每台服务器各自」的：切到远端时这里会跨源去读那台的
+  // /api/voices（服务端已开 CORS）。拿不到就把选择器锁掉并说明原因，
+  // 免得用户以为还能用本地那套模型。
+  const where = srvBase ? srvBase : '本机';
+  voiceLong.innerHTML = '<option>加载中…</option>';
+  versionLong.innerHTML = '<option>加载中…</option>';
   try {
-    const r = await fetch(api('/api/voices'));
+    const r = await fetch(api('/api/voices'), { cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
     const data = await r.json();
-    const opts = data.voices.map(v =>
+    const opts = (data.voices || []).map(v =>
       `<option value="${v.name}">${v.name} — ${v.description || ''}</option>`).join('');
-    voiceLong.innerHTML = opts;
+    voiceLong.innerHTML = opts || '<option>（无）</option>';
     const vers = (data.versions || []).map(v =>
       `<option value="${v.name}">${v.label || v.name}</option>`).join('');
-    versionLong.innerHTML = vers;
+    versionLong.innerHTML = vers || '<option>（无）</option>';
     if (data.default_version) versionLong.value = data.default_version;
-    $('note').textContent = `${data.voices.length} 个声音可用 · ${(data.versions || []).length} 个模型版本`;
+    versionLong.disabled = !vers;
+    var cap = data.backend_capabilities;
+    $('note').textContent = `${data.voices.length} 个声音可用 · ${(data.versions || []).length} 个模型版本`
+      + (cap ? ` · ${where} 后端支持: ${cap.join(' / ')}` : ` · ${where}`);
+    status.textContent = '';
   } catch(e) {
-    status.textContent = '加载声音列表失败: ' + e;
+    // 跨源被拦 / 服务器没起 / 域名不通，都落到这里：明确告诉用户是"这台连不上"
+    voiceLong.innerHTML = '<option>（本服务器不可用）</option>';
+    versionLong.innerHTML = '<option>（本服务器不可用）</option>';
+    voiceLong.disabled = versionLong.disabled = true;
+    $('note').textContent = `服务器「${where}」不可用：${e.message || e}`;
+    status.textContent = `⚠ 无法读取 ${where} 的音色与模型列表（检查地址/证书/服务是否启动）`;
   }
 }
 
@@ -2721,6 +2806,10 @@ async def voices():
                       "sample_steps": MODEL_PROFILES[k].get("sample_steps")}
                      for k in MODEL_KEYS],
         "default_version": DEFAULT_MODEL,
+        # 这台机器的能力来源：配置 ∩ 后端声明。前端拿它判断"该服务器支持什么"，
+        # 也为将来多机器合并展示留字段。
+        "backend_capabilities": BACKEND_CAPS,
+        "server_name": (config.get("servers") or [{}])[0].get("name", ""),
     }
 
 

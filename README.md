@@ -201,6 +201,31 @@ starts[k] = sum(durations[:k])
 `GET /api/voices` 的 `versions` 现在只返回 v5Turbo，`GET /api/health` 的 `pool`
 会列出各端口的实时状态（cold/warming/hot）。
 
+### 🖥 多服务器与模型能力
+
+前端顶栏的服务器下拉由 `config_intel.yaml` 的 `servers:` 驱动，每台机器的
+**音色与模型版本各自独立** —— 切过去后前端跨源读那台的 `/api/voices`（服务端已开
+CORS）。加机器只改配置：
+
+```yaml
+servers:
+  - name: "本机 A770"
+    url: ""                        # 空 = 同源
+  - name: "9070XT"
+    url: "https://other:8000"
+```
+
+**模型列表不是写死的**：服务端启动时会读
+
+1. 后端根目录的 `BSAI_PATCH.json`（Patcher 装完补丁自动写的能力清单）
+2. 后端自己的 `GPT_SoVITS/configs/tts_infer.yaml` 里真实存在的版本段
+
+两者取交集，再和本机 `models:` 配置交叉，只对外宣称真正能跑的版本。
+只装了 v4 的机器不会显示 v5turbo；完全没有交集时日志会告警，提示补丁没装好。
+
+`/api/voices` 额外返回 `backend_capabilities`（如 `["v4","v5turbo"]`）和
+`server_name`，前端会把它显示在音色下方。
+
 ## 🔌 对接的 API
 
 | 方法 | 路径 | 说明 |
