@@ -1864,6 +1864,8 @@ input[type=color] { width:38px; height:26px; padding:0; border:none; background:
         <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
         <div class="progress-text" id="progressText"></div>
       </div>
+      <!-- 合成中断时出现：用「当前选中的服务器」从断点继续 -->
+      <button class="btn-sec" id="retryBtn" style="display:none; margin-top:8px;">🔁 重试（从断点继续）</button>
       <div class="task-info" id="taskInfo" style="display:none; margin-top:12px; padding:10px; border-radius:10px; background:rgba(0,0,0,0.25); font-size:12px; line-height:1.8; word-break:break-all;">
         <div>📋 任务ID: <span id="taskIdText"></span></div>
         <div style="color:#888;">⚠️ 断网/刷新后可凭任务ID恢复（2天内有效）</div>
@@ -2014,6 +2016,11 @@ function applyServer(idx, initial) {
   loadVoices();
 }
 
+function srvName() {
+  const s = serverList[srvIdx];
+  return (s && s.name) || '本机';
+}
+
 async function loadVoices() {
   // 音色和模型版本都是「每台服务器各自」的：请求照样发本机，由本机转发到
   // 选中的那台（带 _srv）。拿不到就把选择器锁掉并说明原因，
@@ -2070,6 +2077,7 @@ function showProgress(pct, label) {
 // 结束轮询链。只清理「自己那条」：换了任务以后，旧链的收尾不能把新链掐掉。
 function endPoll(taskId) {
   if (pollTaskId !== taskId) return;
+  $('retryBtn').style.display = 'none';
   clearTimeout(pollTimer);
   pollTimer = null;
   pollTaskId = null;
@@ -2131,6 +2139,12 @@ async function pollTick(taskId) {
   if (p.status === 'error') {
     showProgress(0, '❌ 合成失败: ' + (p.error || '未知错误'));
     endPoll(taskId);
+    // 断点续跑：沿用这条任务的分句与已落盘片段，用「当前选中的服务器」重来
+    const rb = $('retryBtn');
+    rb.dataset.task = taskId;
+    rb.textContent = `🔁 重试第 ${(p.done || 0) + 1} 句起（${srvName()}）`;
+    rb.style.display = 'block';
+    rb.disabled = false;
     if (partialMode) {
       $('readerHint').textContent = `⚠️ 合成中断（${p.error || '未知错误'}）：`
         + `已就绪的 ${readyCount()}/${p.total} 句仍可点读`;
@@ -2188,6 +2202,7 @@ $('longBtn').onclick = async () => {
     status.textContent = '长文模式建议输入 50 字以上（适合整章/整段文本）';
   }
   longBtn.disabled = true;
+  $('retryBtn').style.display = 'none';
   showProgress(1, '正在提交任务…');
   try {
     const r = await fetch(api('/api/tts/long'), {
@@ -2373,6 +2388,29 @@ async function openReaderNow() {
   btn.disabled = false;
 }
 $('sendToRead').onclick = openReaderNow;
+
+// 重试：请求同样发本机，带 _srv —— 后端据此用当前选中的服务器续跑
+$('retryBtn').onclick = async () => {
+  const btn = $('retryBtn');
+  const taskId = btn.dataset.task;
+  if (!taskId) return;
+  btn.disabled = true;
+  btn.textContent = '⏳ 正在重试…';
+  try {
+    const r = await fetch(api(`/api/tts/retry/${taskId}`), { method: 'POST' });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || ('HTTP ' + r.status));
+    showTaskInfo(taskId);
+    longBtn.disabled = true;
+    btn.style.display = 'none';
+    showProgress(0, `🔁 已从第 ${d.resume_from + 1} 句继续（${d.engine || '本机'}）`);
+    pollTask(taskId);
+  } catch(e) {
+    btn.disabled = false;
+    btn.textContent = '🔁 重试（从断点继续）';
+    status.textContent = '❌ 重试失败: ' + (e.message || e);
+  }
+};
 
 // Lay the sentences out into pages by measuring against the stage: append one
 // at a time to a hidden probe and break as soon as it overflows. The probe is
@@ -2914,6 +2952,14 @@ $('importBtn').onclick = async () => {
   showProgress(100, '已从链接载入任务');
   status.textContent = '已载入任务 ' + id;
   loadReader(id);   // 合成中/已完成都能读：内部挑前缀或最终音频
+  // 打开的是一个失败任务时，同样给出重试入口（从断点、用当前选中的服务器）
+  fetch(api(`/api/tts/progress/${id}`)).then(r => r.ok ? r.json() : null).then(p => {
+    if (!p || p.status !== 'error') return;
+    const rb = $('retryBtn');
+    rb.dataset.task = id;
+    rb.textContent = `🔁 重试第 ${(p.done || 0) + 1} 句起（${srvName()}）`;
+    rb.style.display = 'block';
+  }).catch(() => {});
 })();
 
 buildSwatches();
@@ -3715,6 +3761,50 @@ def tts_long(req: LongTTSRequest, request: Request):
                      daemon=True).start()
     return {"task_id": task_id, "version": key,
             "engine": engine["name"] if engine else ""}
+
+
+def _restart_task(task_id, engine=None):
+    """把一个中断/失败的任务重新拉起来：沿用原分句与已落盘片段，从断点续跑。
+
+    任务身份（id / 分句 / 点读时间轴）完全不变，所以前端只要重新轮询同一个 id；
+    engine 用「重试那一刻选中的服务器」，换台机器重试也行。
+    """
+    t = _get_task(task_id)
+    if t.get("status") == "running":
+        raise HTTPException(409, "任务正在合成中，稍后再试")
+    if t.get("status") == "done":
+        raise HTTPException(400, "任务已完成，无需重试")
+    key = _resolve_model_key(t.get("version"))
+    with _tts_tasks_lock:
+        task = _tts_tasks[task_id]
+        task["status"] = "queued"
+        task["error"] = None
+        task["version"] = key
+        task["audio_seconds"] = 0
+        task["starts"] = []
+        # 失败前已落盘的片段还在，done 就是续跑点（等于 total 时会跳过合成、
+        # 直接合并 —— 正是「句子都齐了、只差合并」的情况）
+        (TASK_CACHE_DIR / f"{task_id}.wav").unlink(missing_ok=True)
+        _save_task(task_id, dict(task))
+        args = (task_id, task.get("text", ""), task.get("voice", "default"),
+                float(task.get("speed", 1.0)), key)
+        resume = int(task.get("done", 0))
+        total = int(task.get("total", 0))
+    threading.Thread(target=_run_long_task, args=args,
+                     kwargs={"engine": engine}, daemon=True).start()
+    logger.info("Long-text task %s restarted from %d/%d (engine=%s)",
+                task_id, resume, total, (engine or {}).get("name", "本机"))
+    return {"task_id": task_id, "resume_from": resume, "total": total,
+            "engine": (engine or {}).get("name", "")}
+
+
+@app.post("/api/tts/retry/{task_id}")
+def tts_retry(task_id: str, request: Request):
+    """重试一个失败的任务；合成走「当前选中的那台服务器」。"""
+    engine = _engine_config(_server_key(request))
+    if engine:
+        _engine_preflight(engine)
+    return _restart_task(task_id, engine)
 
 
 @app.get("/api/tts/progress/{task_id}")
