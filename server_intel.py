@@ -747,6 +747,10 @@ def _load_tasks_from_disk():
             if meta.get("status") == "done" and wav_path.exists():
                 meta["wav"] = wav_path.read_bytes()
                 _tts_tasks[task_id] = meta
+            elif meta.get("status") == "paused":
+                # 用户主动暂停的：重启后保持暂停，等他点「继续」，别自动开跑
+                meta["wav"] = None
+                _tts_tasks[task_id] = meta
             elif meta.get("status") in ("running", "queued") or (
                     meta.get("status") == "error" and meta.get("done", 0) > 0):
                 # Crash recovery: resume from where we left off. "error" tasks
@@ -1122,6 +1126,40 @@ def _clean_text(text):
     return text
 
 
+# ── 任务控制（暂停 / 终止）──────────────────────────────────────
+# 每个任务一份 Event：worker 在批与批之间（重试循环里也查一次）看这两个标志。
+# 用 Event 而不是全局状态，是因为同一时刻可能有多条任务在跑。
+_TASK_CTL = {}
+_TASK_CTL_LOCK = threading.Lock()
+
+
+class _TaskCancelled(Exception):
+    """用户点了「终止」：worker 立刻退出并把这条任务的产物删掉。"""
+
+
+def _task_ctl(task_id):
+    with _TASK_CTL_LOCK:
+        ctl = _TASK_CTL.get(task_id)
+        if not ctl:
+            ctl = {"pause": threading.Event(), "cancel": threading.Event()}
+            _TASK_CTL[task_id] = ctl
+        return ctl
+
+
+def _drop_task_ctl(task_id):
+    with _TASK_CTL_LOCK:
+        _TASK_CTL.pop(task_id, None)
+
+
+def _delete_task(task_id):
+    """终止：停掉 worker 的产物 —— 片段、整章音频、任务记录全删。"""
+    with _tts_tasks_lock:
+        _tts_tasks.pop(task_id, None)
+    _del_task_files(task_id)
+    _drop_task_ctl(task_id)
+    logger.info("Long-text task %s cancelled by user", task_id)
+
+
 def _new_task(text, voice, speed, model_key=None):
     # The task id IS the credential. No endpoint ever lists tasks and
     # task_cache/ is not mounted anywhere, so a chapter is reachable only by
@@ -1150,6 +1188,7 @@ def _run_long_task(task_id, text, voice, speed, model_key=None, engine=None):
     Supports crash recovery — each completed sentence is persisted to disk
     (fragment WAV + progress), so a restart resumes from the last sentence."""
     key = _resolve_model_key(model_key)
+    ctl = _task_ctl(task_id)
     try:
         # Reuse the exact split stored on the task when resuming, so a restart
         # after a split-logic change doesn't shift fragment indices and tear
@@ -1211,6 +1250,8 @@ def _run_long_task(task_id, text, voice, speed, model_key=None, engine=None):
             把整个任务标成 error，而不是「跳过这句、当作完成」。
             """
             for attempt in range(MAX_RETRIES):
+                if ctl["cancel"].is_set():
+                    raise _TaskCancelled()
                 try:
                     wav = _synthesize(text, voice, speed, pad_short=False, model_key=key,
                                       engine=engine)
@@ -1256,6 +1297,17 @@ def _run_long_task(task_id, text, voice, speed, model_key=None, engine=None):
 
         i = start
         while i < total:
+            # 暂停 / 终止：都在「批与批之间」生效，当前这一批不会被打断
+            if ctl["cancel"].is_set():
+                _delete_task(task_id)
+                return
+            if ctl["pause"].is_set():
+                with _tts_tasks_lock:
+                    _tts_tasks[task_id]["status"] = "paused"
+                    _save_task(task_id, dict(_tts_tasks[task_id]))
+                logger.info("Long-text task %s paused at %d/%d", task_id,
+                            _tts_tasks[task_id].get("done", 0), total)
+                return
             cleaned = cleaned_all[i]
             if not cleaned:
                 logger.warning("Long-text: sentence %d empty after cleanup — skipping", i + 1)
@@ -1388,12 +1440,16 @@ def _run_long_task(task_id, text, voice, speed, model_key=None, engine=None):
         for i in range(total):
             (TASK_CACHE_DIR / f"{task_id}.{i}.wav").unlink(missing_ok=True)
         logger.info("Long-text task %s done: %d/%d sentences", task_id, task["done"], task["total"])
+    except _TaskCancelled:
+        _delete_task(task_id)          # 终止：连片段一起删，不留半个任务
     except Exception as e:
         logger.error("Long-text task %s failed: %s", task_id, e, exc_info=True)
         with _tts_tasks_lock:
             _tts_tasks[task_id]["status"] = "error"
             _tts_tasks[task_id]["error"] = str(e)
             _save_task(task_id, dict(_tts_tasks[task_id]))
+    finally:
+        _drop_task_ctl(task_id)
 
 
 # ── FastAPI ──────────────────────────────────────────────────────
@@ -1864,8 +1920,12 @@ input[type=color] { width:38px; height:26px; padding:0; border:none; background:
         <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
         <div class="progress-text" id="progressText"></div>
       </div>
-      <!-- 合成中断时出现：用「当前选中的服务器」从断点继续 -->
-      <button class="btn-sec" id="retryBtn" style="display:none; margin-top:8px;">🔁 重试（从断点继续）</button>
+      <!-- 任务控制：合成中可暂停/终止；中断后可用当前选中的服务器重试 -->
+      <div id="taskCtlRow" style="display:none; gap:8px; margin-top:8px; flex-wrap:wrap;">
+        <button class="btn-sec" id="pauseBtn" style="display:none;">⏸ 暂停</button>
+        <button class="btn-sec" id="stopBtn" style="display:none;">⏹ 终止</button>
+        <button class="btn-sec" id="retryBtn" style="display:none;">🔁 重试</button>
+      </div>
       <div class="task-info" id="taskInfo" style="display:none; margin-top:12px; padding:10px; border-radius:10px; background:rgba(0,0,0,0.25); font-size:12px; line-height:1.8; word-break:break-all;">
         <div>📋 任务ID: <span id="taskIdText"></span></div>
         <div style="color:#888;">⚠️ 断网/刷新后可凭任务ID恢复（2天内有效）</div>
@@ -2068,6 +2128,24 @@ const POLL_MS = 800;        // 合成中的轮询间隔
 const POLL_RETRY_MS = 2000; // 请求失败后的重试间隔
 const POLL_MAX_FAILS = 5;   // 连续失败这么多次才放弃
 
+// 任务控制按钮：running → 暂停+终止；paused → 继续+终止；error → 重试+删除
+function taskButtons(state, taskId, done) {
+  const row = $('taskCtlRow'), pb = $('pauseBtn'), sb = $('stopBtn'), rb = $('retryBtn');
+  pb.style.display = sb.style.display = rb.style.display = 'none';
+  pb.disabled = sb.disabled = rb.disabled = false;
+  if (!state) { row.style.display = 'none'; return; }
+  row.style.display = 'flex';
+  if (taskId) { pb.dataset.task = sb.dataset.task = rb.dataset.task = taskId; }
+  if (state === 'running') {
+    pb.textContent = '⏸ 暂停'; pb.style.display = ''; sb.textContent = '⏹ 终止'; sb.style.display = '';
+  } else if (state === 'paused') {
+    pb.textContent = '▶ 继续'; pb.style.display = ''; sb.textContent = '⏹ 终止'; sb.style.display = '';
+  } else if (state === 'error') {
+    rb.textContent = `🔁 重试第 ${(done || 0) + 1} 句起（${srvName()}）`;
+    rb.style.display = ''; sb.textContent = '🗑 删除任务'; sb.style.display = '';
+  }
+}
+
 function showProgress(pct, label) {
   progressWrap.style.display = 'block';
   progressFill.style.width = pct + '%';
@@ -2077,7 +2155,6 @@ function showProgress(pct, label) {
 // 结束轮询链。只清理「自己那条」：换了任务以后，旧链的收尾不能把新链掐掉。
 function endPoll(taskId) {
   if (pollTaskId !== taskId) return;
-  $('retryBtn').style.display = 'none';
   clearTimeout(pollTimer);
   pollTimer = null;
   pollTaskId = null;
@@ -2118,7 +2195,6 @@ async function pollTick(taskId) {
   }
   if (pollTaskId !== taskId) return;      // await 期间被换掉了
   pollFails = 0;
-  // 进度接口顺带给了后端池快照：状态条跟着走，不必等下一次兜底轮询
 
   const pct = p.total ? Math.round(p.done / p.total * 100) : 0;
 
@@ -2126,6 +2202,7 @@ async function pollTick(taskId) {
     showProgress(100, '✅ 合成完成 — 可在下方点读');
     $('sendToRead').textContent = '📖 打开点读';
     endPoll(taskId);
+    taskButtons(null);
     // 点读里就地升级成整章音频（不重排、不跳页），否则装回合成结果
     if (partialMode) { upgradeToFinal(); return; }
     // No auto-play: a chapter can run for hours. The player is pointed at
@@ -2136,21 +2213,28 @@ async function pollTick(taskId) {
     await loadReader(taskId);
     return;
   }
+  if (p.status === 'paused') {
+    showProgress(pct, `⏸ 已暂停（${p.done}/${p.total} 句）— 点「继续」接着合成`);
+    endPoll(taskId);
+    taskButtons('paused', taskId);
+    if (partialMode) {
+      $('readerHint').textContent = `⏸ 已暂停：已就绪的 ${readyCount()}/${p.total} 句仍可点读`;
+    }
+    return;
+  }
   if (p.status === 'error') {
     showProgress(0, '❌ 合成失败: ' + (p.error || '未知错误'));
     endPoll(taskId);
     // 断点续跑：沿用这条任务的分句与已落盘片段，用「当前选中的服务器」重来
-    const rb = $('retryBtn');
-    rb.dataset.task = taskId;
-    rb.textContent = `🔁 重试第 ${(p.done || 0) + 1} 句起（${srvName()}）`;
-    rb.style.display = 'block';
-    rb.disabled = false;
+    taskButtons('error', taskId, p.done);
     if (partialMode) {
       $('readerHint').textContent = `⚠️ 合成中断（${p.error || '未知错误'}）：`
         + `已就绪的 ${readyCount()}/${p.total} 句仍可点读`;
     }
     return;
   }
+  // 排队/合成中：给暂停与终止入口
+  taskButtons('running', taskId);
   // 排队中（还没拿到后端）与合成中分开显示，避免「0/0 句（0%）」这种死进度
   showProgress(pct, p.status === 'queued' || !p.total
     ? '⏳ 排队中：等待空闲后端…'
@@ -2202,7 +2286,7 @@ $('longBtn').onclick = async () => {
     status.textContent = '长文模式建议输入 50 字以上（适合整章/整段文本）';
   }
   longBtn.disabled = true;
-  $('retryBtn').style.display = 'none';
+  taskButtons(null);
   showProgress(1, '正在提交任务…');
   try {
     const r = await fetch(api('/api/tts/long'), {
@@ -2389,26 +2473,70 @@ async function openReaderNow() {
 }
 $('sendToRead').onclick = openReaderNow;
 
-// 重试：请求同样发本机，带 _srv —— 后端据此用当前选中的服务器续跑
-$('retryBtn').onclick = async () => {
-  const btn = $('retryBtn');
-  const taskId = btn.dataset.task;
+// 继续/重试：请求同样发本机，带 _srv —— 后端据此用当前选中的服务器续跑
+async function resumeTask(taskId, btn) {
   if (!taskId) return;
+  const old = btn.textContent;
   btn.disabled = true;
-  btn.textContent = '⏳ 正在重试…';
+  btn.textContent = '⏳ 正在恢复…';
   try {
     const r = await fetch(api(`/api/tts/retry/${taskId}`), { method: 'POST' });
     const d = await r.json();
     if (!r.ok) throw new Error(d.detail || ('HTTP ' + r.status));
     showTaskInfo(taskId);
     longBtn.disabled = true;
-    btn.style.display = 'none';
-    showProgress(0, `🔁 已从第 ${d.resume_from + 1} 句继续（${d.engine || '本机'}）`);
+    taskButtons('running', taskId);
+    showProgress(0, `▶ 从第 ${d.resume_from + 1} 句继续（${d.engine || '本机'}）`);
     pollTask(taskId);
   } catch(e) {
     btn.disabled = false;
-    btn.textContent = '🔁 重试（从断点继续）';
-    status.textContent = '❌ 重试失败: ' + (e.message || e);
+    btn.textContent = old;
+    status.textContent = '❌ 恢复失败: ' + (e.message || e);
+  }
+}
+
+$('retryBtn').onclick = () => resumeTask($('retryBtn').dataset.task, $('retryBtn'));
+
+// 暂停：当前这批跑完才停（片段全部保留），轮询看到 paused 后按钮变成「继续」
+$('pauseBtn').onclick = async () => {
+  const btn = $('pauseBtn');
+  const taskId = btn.dataset.task;
+  if (!taskId) return;
+  if (btn.textContent.indexOf('继续') >= 0) return resumeTask(taskId, btn);
+  btn.disabled = true;
+  btn.textContent = '⏳ 正在暂停…';
+  try {
+    const r = await fetch(api(`/api/tts/pause/${taskId}`), { method: 'POST' });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || ('HTTP ' + r.status));
+  } catch(e) {
+    btn.disabled = false;
+    btn.textContent = '⏸ 暂停';
+    status.textContent = '❌ 暂停失败: ' + (e.message || e);
+  }
+};
+
+// 终止 / 删除：停掉 worker 并清掉这条任务的产物
+$('stopBtn').onclick = async () => {
+  const btn = $('stopBtn');
+  const taskId = btn.dataset.task;
+  if (!taskId) return;
+  const deleting = btn.textContent.indexOf('删除') >= 0;
+  if (!confirm(deleting ? '删除这条任务的记录与已合成音频？无法恢复。'
+                        : '终止合成？已合成的部分会被删除，无法恢复。')) return;
+  btn.disabled = true;
+  try {
+    const r = await fetch(api(`/api/tts/stop/${taskId}`), { method: 'POST' });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || ('HTTP ' + r.status));
+    endPoll(taskId);
+    taskButtons(null);
+    showProgress(0, deleting ? '🗑 任务已删除' : '⏹ 已终止');
+    player.style.display = 'none';
+    status.textContent = (deleting ? '已删除任务 ' : '已终止任务 ') + taskId;
+  } catch(e) {
+    btn.disabled = false;
+    status.textContent = '❌ 操作失败: ' + (e.message || e);
   }
 };
 
@@ -2954,11 +3082,10 @@ $('importBtn').onclick = async () => {
   loadReader(id);   // 合成中/已完成都能读：内部挑前缀或最终音频
   // 打开的是一个失败任务时，同样给出重试入口（从断点、用当前选中的服务器）
   fetch(api(`/api/tts/progress/${id}`)).then(r => r.ok ? r.json() : null).then(p => {
-    if (!p || p.status !== 'error') return;
-    const rb = $('retryBtn');
-    rb.dataset.task = id;
-    rb.textContent = `🔁 重试第 ${(p.done || 0) + 1} 句起（${srvName()}）`;
-    rb.style.display = 'block';
+    if (!p) return;
+    if (p.status === 'paused') taskButtons('paused', id);
+    else if (p.status === 'error') taskButtons('error', id, p.done);
+    else if (p.status === 'running' || p.status === 'queued') taskButtons('running', id);
   }).catch(() => {});
 })();
 
@@ -3775,6 +3902,7 @@ def _restart_task(task_id, engine=None):
     if t.get("status") == "done":
         raise HTTPException(400, "任务已完成，无需重试")
     key = _resolve_model_key(t.get("version"))
+    _drop_task_ctl(task_id)        # 清掉上一次的 pause/cancel 标志
     with _tts_tasks_lock:
         task = _tts_tasks[task_id]
         task["status"] = "queued"
@@ -3805,6 +3933,29 @@ def tts_retry(task_id: str, request: Request):
     if engine:
         _engine_preflight(engine)
     return _restart_task(task_id, engine)
+
+
+@app.post("/api/tts/pause/{task_id}")
+def tts_pause(task_id: str):
+    """暂停：当前这一批跑完后停下，进度与已落盘片段都保留，之后可继续。"""
+    t = _get_task(task_id)
+    if t.get("status") in ("paused",):
+        return {"task_id": task_id, "status": "paused"}
+    if t.get("status") != "running":
+        raise HTTPException(409, f"任务当前状态为 {t.get('status')}，无法暂停")
+    _task_ctl(task_id)["pause"].set()
+    return {"task_id": task_id, "status": "pausing"}
+
+
+@app.post("/api/tts/stop/{task_id}")
+def tts_stop(task_id: str):
+    """终止：立刻停下并删除这条任务的全部产物（片段、整章音频、记录）。"""
+    t = _get_task(task_id)
+    if t.get("status") == "running":
+        _task_ctl(task_id)["cancel"].set()
+        return {"task_id": task_id, "status": "stopping"}
+    _delete_task(task_id)          # 已暂停 / 排队中：直接收掉
+    return {"task_id": task_id, "status": "cancelled"}
 
 
 @app.get("/api/tts/progress/{task_id}")
