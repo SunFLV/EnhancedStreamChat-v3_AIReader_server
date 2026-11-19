@@ -82,6 +82,17 @@ voices:
     ref_audio_path: "D:/BSAIReader/server/voices/soyo/ref.wav"
     prompt_text: "ありがと。見てないんじゃない私に言われても。"
 
+  # 远端 9070XT 用的就是这段参考音（sunflv_phone），放一份在本机可以对比音色。
+  # 原始文件（voices/phone/ref.wav）RMS 只有 0.068，比 default_ref 的 0.186 低 11 dB，
+  # 直接喂给 XPU 会让模型「跑飞」：同一句话生成 291~336 token（7.9 s 音频），
+  # 而正常应约 220 token（3.4 s）。归一化到峰值 0.9 后恢复正常，故用 ref_norm.wav。
+  - name: "v4_phone"
+    description: "SunFLV · 电话号码参考音 (5.1s，与远端同源)"
+    text_lang: "zh"
+    prompt_lang: "zh"
+    ref_audio_path: "D:/BSAIReader/server/voices/phone/ref_norm.wav"
+    prompt_text: "我的电话号码是13866007742。"
+
   - name: "v4_sunflv"
     description: "SunFLV本人音色 (最新训练)"
     text_lang: "zh"
@@ -140,6 +151,9 @@ models:
     vits_weights_path: "GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2Gv5turbo.pth"
     sample_steps: 4
     is_half: true
+
+# 前端默认选中的音色（留空则用列表第一项）。当前用远端同源的电话号码参考音。
+default_voice: "v4_phone"
 
 # ── 前端可选的 TTS 服务器 ──────────────────────────────────────
 # 前端下拉框直接读 /api/servers，按这个列表渲染。

@@ -2001,6 +2001,9 @@ async function loadVoices() {
     const opts = (data.voices || []).map(v =>
       `<option value="${v.name}">${v.name} — ${v.description || ''}</option>`).join('');
     voiceLong.innerHTML = opts || '<option>（无）</option>';
+    if (data.default_voice && voiceLong.querySelector(`option[value="${data.default_voice}"]`)) {
+      voiceLong.value = data.default_voice;
+    }
     const vers = (data.versions || []).map(v =>
       `<option value="${v.name}">${v.label || v.name}</option>`).join('');
     versionLong.innerHTML = vers || '<option>（无）</option>';
@@ -3153,6 +3156,8 @@ async def voices():
                       "sample_steps": MODEL_PROFILES[k].get("sample_steps")}
                      for k in MODEL_KEYS],
         "default_version": DEFAULT_MODEL,
+        # 默认音色（config 的 default_voice，缺省就是列表第一项）
+        "default_voice": (config.get("default_voice") or next(iter(VOICES), "")),
         # 这台机器的能力来源：配置 ∩ 后端声明。前端拿它判断"该服务器支持什么"，
         # 也为将来多机器合并展示留字段。
         "backend_capabilities": BACKEND_CAPS,
