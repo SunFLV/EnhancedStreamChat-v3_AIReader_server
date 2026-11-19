@@ -1199,10 +1199,17 @@ def _run_long_task(task_id, text, voice, speed, model_key=None, engine=None):
                 chunks[i] = raw
                 durations[i] = _wav_seconds(raw)
 
-        MAX_RETRIES = 10  # 每句最多重试次数（原3次对偶发超时/静音不够）
+        # 每句最多重试次数。引擎模式下远端要么很快失败、要么整台挂了，
+        # 10 次 × 超时只会让用户干等；3 次足够确认「这台不可用」。
+        MAX_RETRIES = 3 if engine else 10
+        last_error = {"msg": ""}
 
         def _synth_one(text, i):
-            """单句合成（带重试）。批处理失败时的回退路径。"""
+            """单句合成（带重试）。批处理失败时的回退路径。
+
+            彻底失败时返回 None，并把原因记在 last_error 里 —— 调用方会因此
+            把整个任务标成 error，而不是「跳过这句、当作完成」。
+            """
             for attempt in range(MAX_RETRIES):
                 try:
                     wav = _synthesize(text, voice, speed, pad_short=False, model_key=key,
@@ -1210,6 +1217,7 @@ def _run_long_task(task_id, text, voice, speed, model_key=None, engine=None):
                     if wav:
                         return wav
                 except HTTPException as e:
+                    last_error["msg"] = str(getattr(e, "detail", e))
                     logger.warning("Long-text: sentence %d attempt %d/%d failed: %s",
                                    i + 1, attempt + 1, MAX_RETRIES, e.detail)
                     time.sleep(1)
@@ -1217,10 +1225,16 @@ def _run_long_task(task_id, text, voice, speed, model_key=None, engine=None):
                     # A request error must NOT abort the whole task — it's a
                     # transient backend issue; retry the sentence (and let the
                     # failover inside _synthesize deal with the backend).
+                    last_error["msg"] = f"{type(e).__name__}: {e}"
                     logger.warning("Long-text: sentence %d attempt %d/%d request error: %s",
                                    i + 1, attempt + 1, MAX_RETRIES, e)
                     time.sleep(1)
-            logger.warning("Long-text: sentence %d SKIPPED after %d attempts", i + 1, MAX_RETRIES)
+                except Exception as e:
+                    last_error["msg"] = f"{type(e).__name__}: {e}"
+                    logger.warning("Long-text: sentence %d attempt %d/%d error: %s",
+                                   i + 1, attempt + 1, MAX_RETRIES, e)
+                    time.sleep(1)
+            logger.warning("Long-text: sentence %d FAILED after %d attempts", i + 1, MAX_RETRIES)
             return None
 
         def _commit(i, wav):
@@ -1303,11 +1317,16 @@ def _run_long_task(task_id, text, voice, speed, model_key=None, engine=None):
                     elif any(w is None for w in wavs):
                         wavs = [w if w else _synth_one(t, gi) for (gi, t), w in zip(group, wavs)]
                     for (gi, _t), wav in zip(group, wavs):
-                        _commit(gi, wav)
-                        committed.add(gi)
+                        # 只有真拿到音频才算这句完成；_commit(None) 不写文件，
+                        # 但以前这里无条件 add，于是「没合成出来」也被当成完成
+                        if wav:
+                            _commit(gi, wav)
+                            committed.add(gi)
             else:
-                _commit(group[0][0], _synth_one(group[0][1], group[0][0]))
-                committed.add(group[0][0])
+                wav = _synth_one(group[0][1], group[0][0])
+                if wav:
+                    _commit(group[0][0], wav)
+                    committed.add(group[0][0])
 
             # 流式里被判静音、或整批失败漏掉的句子：逐句补
             for gi, gt in group:
@@ -1315,6 +1334,22 @@ def _run_long_task(task_id, text, voice, speed, model_key=None, engine=None):
                     wav = _synth_one(gt, gi)
                     if wav:
                         _commit(gi, wav)
+
+            # 还有句子没拿到音频 → 不能「跳过并当作完成」，否则点读会指着一段
+            # 不存在的音频（任务显示 100%，实际少了句子）。整条任务标 error，
+            # done 停在上一批末尾，重试就从这句继续。
+            missing = [gi for gi, _t in group if gi not in committed]
+            if missing:
+                nums = "、".join(str(m + 1) for m in missing[:3])
+                if len(missing) > 3:
+                    nums += " 等"
+                # done 停在这句之前：已落盘的片段不用重做，重试正好从它开始
+                with _tts_tasks_lock:
+                    _tts_tasks[task_id]["done"] = missing[0]
+                    _save_task(task_id, dict(_tts_tasks[task_id]))
+                raise RuntimeError(
+                    f"第 {nums} 句合成失败（{last_error['msg'] or '未知原因'}）——"
+                    f"任务已停止，重试会从第 {missing[0] + 1} 句继续")
 
             with _tts_tasks_lock:
                 _tts_tasks[task_id]["done"] = group[-1][0] + 1
@@ -1452,6 +1487,19 @@ def _engine_config(raw):
     }
 
 
+def _engine_preflight(eng):
+    """任务开跑前先确认那台在：连不上就 502，避免「建了任务、跑到第一句才报错」。"""
+    for path in ("/healthz", "/health", "/api/health"):
+        try:
+            r = requests.get(eng["url"] + path, headers=_engine_headers(eng), timeout=3)
+            if r.status_code < 500:
+                return
+        except requests.exceptions.RequestException:
+            continue
+    raise HTTPException(502, f"无法连接合成引擎「{eng['name']}」（{eng['url']}）——"
+                             f"检查那台是否启动 / 端口是否可达")
+
+
 def _engine_headers(eng):
     h = {"Content-Type": "application/json"}
     if eng.get("api_key"):
@@ -1488,7 +1536,7 @@ def _engine_synth(eng, text, voice, speed):
             payload["voice"] = v
         try:
             r = requests.post(eng["url"] + "/", headers=_engine_headers(eng),
-                              json=payload, timeout=900)
+                              json=payload, timeout=(5, 900))
         except requests.exceptions.RequestException as e:
             raise HTTPException(502, f"无法连接合成引擎「{eng['name']}」: {e}")
         if r.status_code != 200:
@@ -1511,7 +1559,7 @@ def _engine_synth_batch(eng, texts, voice, speed):
         payload["voice"] = v
     try:
         r = requests.post(eng["url"] + "/tts_batch", headers=_engine_headers(eng),
-                          json=payload, timeout=1800)
+                          json=payload, timeout=(5, 1800))
         if r.status_code != 200:
             logger.warning("Engine %s batch HTTP %s: %s", eng["name"],
                            r.status_code, r.text[:160])
@@ -1769,25 +1817,10 @@ audio { width:100%; }
 input[type=file] { width:100%; font-size:12.5px; color:#aaa; margin-top:4px; }
 input[type=color] { width:38px; height:26px; padding:0; border:none; background:none;
                     cursor:pointer; vertical-align:middle; }
-.bk-label { color:#888; white-space:nowrap; font-size:12.5px; }
 /* 服务器选择器（下拉项由后端 /api/servers 提供，配置驱动） */
 .srv-wrap { display:inline-flex; align-items:center; gap:5px; white-space:nowrap;
             font-size:12.5px; color:#aaa; }
 #serverPick { max-width:150px; padding:4px 8px; font-size:12.5px; cursor:pointer; }
-#bkChips { display:inline-flex; gap:8px; flex-wrap:wrap; }
-.bk-chip {
-  display:inline-flex; align-items:center; gap:6px; padding:3px 10px;
-  border-radius:999px; background:rgba(255,255,255,0.06);
-  border:1px solid rgba(255,255,255,0.14); white-space:nowrap; font-size:12.5px;
-}
-.bk-dot { width:8px; height:8px; border-radius:50%; background:#666; flex:none; }
-.bk-chip.hot { border-color:rgba(74,222,128,0.55); color:#bbf7d0; }
-.bk-chip.hot .bk-dot { background:#4ade80; box-shadow:0 0 6px #4ade80; }
-.bk-chip.warming { border-color:rgba(250,204,21,0.55); color:#fde68a; }
-.bk-chip.warming .bk-dot { background:#facc15; box-shadow:0 0 6px #facc15; animation:bkblink 1s infinite; }
-.bk-chip.cold { color:#999; }
-.bk-msg { color:#a78bfa; font-size:12px; }
-@keyframes bkblink { 50% { opacity:.35; } }
 </style>
 </head>
 <body>
@@ -1802,10 +1835,6 @@ input[type=color] { width:38px; height:26px; padding:0; border:none; background:
     <label class="srv-wrap" title="切换 TTS 服务器（列表来自服务端配置）">
       🖥 <select id="serverPick"></select>
     </label>
-    <!-- 后端引擎实时状态（SSE 推送：启动 / 加载 N s / 就绪 / 空闲卸载） -->
-    <span class="bk-label">⚙</span>
-    <span id="bkChips"></span>
-    <span class="bk-msg" id="bkMsg"></span>
   </div>
 
   <!-- 合成 -->
@@ -1981,7 +2010,6 @@ function applyServer(idx, initial) {
     // 用户主动切换 = 换了一个后端：停播、重拉音色、重建事件流
     try { audio.pause(); } catch(_) {}
     player.style.display = 'none';
-    if (typeof initBackendStatus === 'function') initBackendStatus();
   }
   loadVoices();
 }
@@ -2083,7 +2111,6 @@ async function pollTick(taskId) {
   if (pollTaskId !== taskId) return;      // await 期间被换掉了
   pollFails = 0;
   // 进度接口顺带给了后端池快照：状态条跟着走，不必等下一次兜底轮询
-  if (p.pool) { bkPool = p.pool; bkRender(); }
 
   const pct = p.total ? Math.round(p.done / p.total * 100) : 0;
 
@@ -2877,88 +2904,6 @@ $('importBtn').onclick = async () => {
   }
 };
 
-// ── 后端引擎状态条：初始快照 + SSE 实时推送 + 兜底轮询 ──
-let bkPool = [], bkEvents = [], bkPulling = false;
-
-function bkRender() {
-  const chips = $('bkChips'), msg = $('bkMsg');
-  const warm = bkPool.filter(b => b.state === 'warming');
-  const hot  = bkPool.filter(b => b.state === 'hot');
-  const cold = bkPool.filter(b => b.state === 'cold');
-  chips.innerHTML = '';
-  [...hot, ...warm, ...cold].forEach(b => {
-    const el = document.createElement('span');
-    el.className = 'bk-chip ' + b.state;
-    let label = b.port + (b.model ? ' · ' + b.model : '');
-    if (b.state === 'hot') label += ' · 就绪';
-    else if (b.state === 'warming') label += ' · 加载中' + (b.elapsed != null ? ` ${b.elapsed}s` : '');
-    else label += ' · 未加载';
-    el.innerHTML = `<span class="bk-dot"></span>${label}`;
-    chips.appendChild(el);
-  });
-  const last = bkEvents.length ? bkEvents[bkEvents.length - 1] : null;
-  if (warm.length) {
-    msg.textContent = last && last.state === 'warming'
-      ? last.msg
-      : `后端 ${warm.map(b => b.port).join('/')} 正在加载模型…首次合成约需等待 90 秒`;
-    msg.style.color = '#fde68a';
-  } else if (last) {
-    msg.textContent = last.msg;
-    msg.style.color = '#a78bfa';
-  } else if (!hot.length) {
-    msg.textContent = '空闲：首次合成会自动加载模型（约 90 秒）';
-    msg.style.color = '#888';
-  } else {
-    msg.textContent = '';
-  }
-}
-
-// 拉一次完整快照。SSE 只是「快」的那条路，不能当成唯一来源：连接被代理
-// 缓冲 / 手机休眠后不报错也不再送事件时，界面就会永久停在旧状态。
-function bkPull() {
-  if (bkPulling) return;
-  bkPulling = true;
-  fetch(api('/api/backend/status'), { cache: 'no-store' })
-    .then(r => r.json())
-    .then(d => { bkPool = d.backends || []; bkEvents = (d.events || []).slice(-1); bkRender(); })
-    .catch(() => {})
-    .then(() => { bkPulling = false; });
-}
-
-let bkEventSource = null;
-function initBackendStatus() {
-  bkPull();
-  // 兜底轮询：状态条 5 s 对齐一次（也让「加载中 N s」跟着走）
-  setInterval(bkPull, 5000);
-  document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) bkPull();     // 切回前台/标签页立刻对齐
-  });
-  try {
-    if (bkEventSource) bkEventSource.close();   // 切服务器时先断旧连接
-    const es = bkEventSource = new EventSource(api('/api/backend/events'));
-    es.onopen = () => bkPull();         // 重连成功：断线期间的事件已丢，补一次快照
-    es.onmessage = (e) => {
-      try {
-        const m = JSON.parse(e.data);
-        if (m.type === 'snapshot') {
-          bkPool = m.backends || [];
-          bkEvents = (m.events || []).slice(-1);
-        } else if (m.type === 'backend') {
-          if (!bkPool.some(p => p.port === m.port)) { bkPull(); return; }  // 池子变了
-          bkPool = bkPool.map(p => p.port === m.port
-            ? { ...p, state: m.state, elapsed: m.state === 'cold' ? null : p.elapsed }
-            : p);
-          bkEvents = [{ msg: m.msg, state: m.state }];
-        } else {
-          return;                        // ping 等保活帧：不改状态
-        }
-        bkRender();
-      } catch(_) {}
-    };
-    es.onerror = () => { bkPull(); };    // EventSource 会自连；同时立刻补一次
-  } catch(_) {}
-}
-
 // ── 深链：?task=<id>&key=<key> 直接打开某个任务的点读（可收藏/分享）──
 (function initFromUrl() {
   const q = new URLSearchParams(location.search);
@@ -2971,7 +2916,6 @@ function initBackendStatus() {
   loadReader(id);   // 合成中/已完成都能读：内部挑前缀或最终音频
 })();
 
-initBackendStatus();
 buildSwatches();
 applyAppearance();
 loadServers();   // 读 /api/servers → 渲染下拉 → applyServer() 里会调 loadVoices()
@@ -3756,6 +3700,8 @@ def tts_long(req: LongTTSRequest, request: Request):
     """Start async long-text synthesis. Returns the task id — the credential."""
     key = _resolve_model_key(req.version)
     engine = _engine_config(_server_key(request))
+    if engine:
+        _engine_preflight(engine)      # 连不上就直接 502，不建一个注定失败的任务
     task_id = _new_task(req.text, req.voice, req.speed, key)
     if engine:
         # 任务本体仍在本机（分句/进度/点读/断点续传都不变），只有合成发给远端
