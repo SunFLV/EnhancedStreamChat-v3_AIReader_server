@@ -78,6 +78,11 @@ servers:
 - name: 本机(测试 8010)
   url: ''
   desc: 同源
-- name: 线上 8000
-  url: https://127.0.0.1:8000
-  desc: 转发测试目标
+- name: 9070XT
+  url: http://streaming6.sunflv.top:9881
+  desc: 引擎测试
+  engine:
+    api_key: bsai-3c0fe1662944087cc0aa8505
+    default_voice: sunflv_phone
+    voice_map:
+      v4_sunflv: sunflv_phone

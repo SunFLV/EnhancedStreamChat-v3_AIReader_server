@@ -228,6 +228,36 @@ forward_tls_verify: false          # 转发到自签名 https 时用（默认就
 - `/api/servers`、`/api/health` 永远由本机处理，不参与转发
 - 远端连不上时返回 `502` 并带上原因，前端会提示「无法连接服务器「xxx」」
 
+### ⚡ 借远端算力：`engine`
+
+如果那台只跑着池 API（`/tts_batch`）而没有 bsai 代理，可以让本机把「合成」这一步
+交出去 —— 分句、进度、点读时间轴、断点续传全部仍在本机，只有每一句的合成请求
+发给远端。配置里加一段 `engine:` 即可：
+
+```yaml
+servers:
+  - name: "本机 A770"
+    url: ""
+  - name: "9070XT"
+    url: "http://streaming6.sunflv.top:9881"
+    desc: "池 API（cuda×4）· 长文用它的算力"
+    engine:
+      api_key: "bsai-..."          # 远端池的 X-API-Key（没开鉴权可省略）
+      default_voice: "sunflv_phone"
+      voice_map:                   # 本机音色名 → 远端音色名
+        v4_sunflv: sunflv_phone
+```
+
+行为：
+
+- 前端下拉里显示 `⚡ 合成引擎`；选中后 `/api/voices` 仍转发到那台（看它有哪些音色）
+- `/api/tts/long`、`/api/tts` 由**本机**处理，只是把每句/每批发到 `engine.url`
+- 音色按 `voice_map` 改名；没配映射的走 `default_voice`；映射到的音色出静音时
+  自动用 `default_voice` 重试一次（远端情绪参考音念中性短句容易变气声）
+- 远端挂掉时返回 502，任务标 error，不会静默产出空音频
+- 实测（本地 A770 vs 9070XT 池）：4 句长文 **3 s** 完成（本机约 40~60 s），
+  单句 1.7 s（本机约 10 s）
+
 **模型列表不是写死的**：服务端启动时会读
 
 1. 后端根目录的 `BSAI_PATCH.json`（Patcher 装完补丁自动写的能力清单）

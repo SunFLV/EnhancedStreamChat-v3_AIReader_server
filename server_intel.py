@@ -1145,7 +1145,7 @@ def _new_task(text, voice, speed, model_key=None):
     return task_id
 
 
-def _run_long_task(task_id, text, voice, speed, model_key=None):
+def _run_long_task(task_id, text, voice, speed, model_key=None, engine=None):
     """Background worker: synthesize each sentence, merge, store result.
     Supports crash recovery — each completed sentence is persisted to disk
     (fragment WAV + progress), so a restart resumes from the last sentence."""
@@ -1205,7 +1205,8 @@ def _run_long_task(task_id, text, voice, speed, model_key=None):
             """单句合成（带重试）。批处理失败时的回退路径。"""
             for attempt in range(MAX_RETRIES):
                 try:
-                    wav = _synthesize(text, voice, speed, pad_short=False, model_key=key)
+                    wav = _synthesize(text, voice, speed, pad_short=False, model_key=key,
+                                      engine=engine)
                     if wav:
                         return wav
                 except HTTPException as e:
@@ -1290,11 +1291,13 @@ def _run_long_task(task_id, text, voice, speed, model_key=None):
                         _save_task(task_id, dict(_tts_tasks[task_id]))
 
             if len(group) > 1:
-                got = (_synthesize_batch_stream([t for _, t in group], voice, speed, key, _on_item)
+                got = (_synthesize_batch_stream([t for _, t in group], voice, speed, key, _on_item,
+                                                 engine=engine)
                        if DYNAMIC_BATCH else None)
                 if got is None:
                     # 流式不可用（老后端/报错）→ 退回一次性批量，再不行逐句
-                    wavs = _synthesize_batch([t for _, t in group], voice, speed, model_key=key)
+                    wavs = _synthesize_batch([t for _, t in group], voice, speed,
+                                             model_key=key, engine=engine)
                     if wavs is None:
                         wavs = [_synth_one(t, gi) for gi, t in group]
                     elif any(w is None for w in wavs):
@@ -1351,7 +1354,7 @@ def _run_long_task(task_id, text, voice, speed, model_key=None):
             (TASK_CACHE_DIR / f"{task_id}.{i}.wav").unlink(missing_ok=True)
         logger.info("Long-text task %s done: %d/%d sentences", task_id, task["done"], task["total"])
     except Exception as e:
-        logger.error("Long-text task %s failed: %s", task_id, e)
+        logger.error("Long-text task %s failed: %s", task_id, e, exc_info=True)
         with _tts_tasks_lock:
             _tts_tasks[task_id]["status"] = "error"
             _tts_tasks[task_id]["error"] = str(e)
@@ -1389,28 +1392,158 @@ def _forward_tls_verify():
     return bool(config.get("forward_tls_verify", False))
 
 
-def _selected_remote(request):
-    """从 _srv（查询参数，音频/EventSource 也能带）或 X-BSAI-Server 取出目标机器的根地址。
+def _server_key(request):
+    """请求里选的服务器：_srv 查询参数（音频/EventSource 也带得上）或请求头。"""
+    return request.query_params.get("_srv") or request.headers.get("x-bsai-server")
 
-    _srv 支持下标（0 = 本机）或服务器名；指向本机/空 url 时返回 None（不转发）。
-    """
-    raw = request.query_params.get("_srv") or request.headers.get("x-bsai-server")
+
+def _server_by_key(raw):
+    """_srv（下标或服务器名）→ config 里的那台。指向本机时返回 None。"""
     if raw in (None, "", "0", "local"):
         return None
     servers = [s for s in (config.get("servers") or [])
                if isinstance(s, dict) and s.get("name")]
-    picked = None
     if str(raw).isdigit():
         i = int(raw)
-        picked = servers[i] if 0 <= i < len(servers) else None
-    else:
-        picked = next((s for s in servers if s.get("name") == raw), None)
+        return servers[i] if 0 <= i < len(servers) else None
+    return next((s for s in servers if s.get("name") == raw), None)
+
+
+def _selected_remote(request):
+    """要转发到哪台。返回 (根地址, 名字)；本机/空 url 返回 None。"""
+    picked = _server_by_key(_server_key(request))
     url = str((picked or {}).get("url") or "").rstrip("/")
     return (url, picked.get("name")) if url else None
 
 
+def _engine_config(raw):
+    """把某台服务器解析成「合成引擎」。
+
+    服务器条目里写 engine: 就走引擎模式 —— 长文任务、进度、点读仍然全部留在
+    本机（任务缓存、时间轴、断点续传都不变），只是每一句的合成请求发给远端池，
+    所以远端不装 bsai 代理也能吃到它的算力。
+
+        - name: "9070XT"
+          url: "http://other:9881"       # 能力接口（/api/voices）也从这里取
+          engine:
+            api_key: "..."               # 远端池的 X-API-Key（没开鉴权就省略）
+            default_voice: "sunflv_fire" # 本机音色在远端没有对应时的兜底
+            voice_map:                   # 本机音色名 → 远端音色名
+              v4_default: sunflv_fire
+    """
+    srv = _server_by_key(raw)
+    if not srv:
+        return None
+    eng = srv.get("engine")
+    if eng is True:
+        eng = {}
+    if not isinstance(eng, dict) or eng.get("enabled") is False:
+        return None
+    url = str(eng.get("url") or srv.get("url") or "").rstrip("/")
+    if not url:
+        return None
+    return {
+        "name": srv.get("name") or "",
+        "url": url,
+        "api_key": str(eng.get("api_key") or ""),
+        "voice_map": dict(eng.get("voice_map") or {}),
+        "default_voice": str(eng.get("default_voice") or ""),
+        "voices": list(eng.get("voices") or []),
+    }
+
+
+def _engine_headers(eng):
+    h = {"Content-Type": "application/json"}
+    if eng.get("api_key"):
+        h["X-API-Key"] = eng["api_key"]
+    return h
+
+
+def _engine_voice(eng, voice):
+    """本机音色名 → 远端音色名：显式映射优先，其次同名，最后兜底默认。"""
+    vm = eng.get("voice_map") or {}
+    if voice in vm:
+        return vm[voice]
+    if voice and voice in (eng.get("voices") or []):
+        return voice
+    return eng.get("default_voice") or ""
+
+
+def _engine_synth(eng, text, voice, speed):
+    """单句走远端池的 POST /（直接回 audio/wav）。
+
+    远端的参考音不一定适配所有文本（实测「火海句」那种情绪参考音念短句会
+    念成气声），所以映射到的音色出静音时，自动退到 default_voice 再试一次。
+    """
+    cands = []
+    for v in (_engine_voice(eng, voice), eng.get("default_voice"), *(eng.get("voices") or [])):
+        if v and v not in cands:
+            cands.append(v)
+    cands = cands[:2] or [""]
+    last_err = ""
+    for v in cands:
+        payload = {"text": text, "speed_factor": speed,
+                   "sample_steps": 4, "media_type": "wav"}
+        if v:
+            payload["voice"] = v
+        try:
+            r = requests.post(eng["url"] + "/", headers=_engine_headers(eng),
+                              json=payload, timeout=900)
+        except requests.exceptions.RequestException as e:
+            raise HTTPException(502, f"无法连接合成引擎「{eng['name']}」: {e}")
+        if r.status_code != 200:
+            last_err = f"HTTP {r.status_code}: {r.text[:160]}"
+            continue
+        if r.content and not _is_silent_wav(r.content):
+            return r.content
+        last_err = f"音色 {v or '(默认)'} 返回静音"
+        logger.warning("Engine %s silent with voice=%s for %r", eng["name"], v, text[:20])
+    raise HTTPException(502, f"引擎「{eng['name']}」合成失败：{last_err}")
+
+
+def _engine_synth_batch(eng, texts, voice, speed):
+    """一批句子走远端池的 /tts_batch，按序返回逐句 WAV；不可用时 None。"""
+    payload = {"texts": list(texts), "speed_factor": speed, "sample_steps": 4,
+               "text_split_method": "cut0", "batch_size": len(texts),
+               "media_type": "wav"}
+    v = _engine_voice(eng, voice)
+    if v:
+        payload["voice"] = v
+    try:
+        r = requests.post(eng["url"] + "/tts_batch", headers=_engine_headers(eng),
+                          json=payload, timeout=1800)
+        if r.status_code != 200:
+            logger.warning("Engine %s batch HTTP %s: %s", eng["name"],
+                           r.status_code, r.text[:160])
+            return None
+        data = r.json()
+        wavs = [base64.b64decode(w) for w in (data.get("wavs") or [])]
+    except Exception as e:
+        logger.warning("Engine %s batch failed: %s", eng["name"], e)
+        return None
+    if len(wavs) != len(texts):
+        logger.warning("Engine %s returned %d wavs for %d texts", eng["name"],
+                       len(wavs), len(texts))
+        return None
+    out = []
+    for t, w in zip(texts, wavs):
+        if w and not _is_silent_wav(w):
+            out.append(w)
+            continue
+        # 批里有句子抽到静音：单独再合成一次（带音色回退），避免整批退回本机
+        try:
+            out.append(_engine_synth(eng, t, voice, speed))
+        except HTTPException as e:
+            logger.warning("Engine %s single retry failed: %s", eng["name"], e.detail)
+            out.append(None)
+    return out
+
+
 # 这些路径永远由本机处理：服务器列表、健康检查、网页本身
 _NO_FORWARD = ("/api/servers", "/api/health")
+# 配了 engine 的机器（只借它的算力）：只有这几条只读元数据转发过去，
+# 任务/进度/音频都留本机 —— 点读时间轴与断点续传仍然由本机维护
+_ENGINE_META = ("/api/voices", "/api/models", "/api/capabilities")
 
 
 @app.middleware("http")
@@ -1423,6 +1556,8 @@ async def _forward_to_selected_server(request: Request, call_next):
     target = _selected_remote(request)
     if not target:
         return await call_next(request)
+    if _engine_config(_server_key(request)) and path not in _ENGINE_META:
+        return await call_next(request)       # 引擎模式：只转发能力查询
     base, name = target
 
     # 组装转发 URL：去掉 _srv（否则远端会再解释一次），其余查询参数原样带上
@@ -1803,6 +1938,7 @@ async function loadServers() {
     // 每台后面标出探测结果：能不能直接切过去用，一眼可见
     const badge = s => {
       if (!s.kind || s.kind === 'local') return '';
+      if (s.engine)             return ` ⚡ 合成引擎${s.detail ? ' · ' + s.detail : ''}`;
       if (s.kind === 'proxy')   return ` ✓ ${s.detail || ''}`;
       if (s.kind === 'backend') return ` ⚠ 仅合成接口${s.detail ? ' · ' + s.detail : ''}`;
       if (s.kind === 'pool')    return ` ⚠ 仅池 API${s.detail ? ' · ' + s.detail : ''}`;
@@ -1830,6 +1966,9 @@ function applyServer(idx, initial) {
     if (s.kind === 'offline') {
       status.textContent = `⚠ ${s.name} 探测不到（${s.detail || '连接失败'}），`
         + `请求会返回 502。检查地址/服务是否启动。`;
+    } else if (s.engine) {
+      status.textContent = `⚡ 已切到 ${s.name}：长文/点读仍在本机，合成由它完成`
+        + `（音色会映射成它自己的参考音）。`;
     } else if (s.kind === 'backend' || s.kind === 'pool') {
       status.textContent = `ℹ 已切到 ${s.name}：合成由它完成，但它没有长文任务与点读接口`
         + `（要完整功能需在那台部署 bsai 附加包）。`;
@@ -2992,12 +3131,12 @@ async def servers():
         url = str(s.get("url") or "")
         item = {"name": s["name"], "url": url, "desc": s.get("desc", "")}
         if not url:
-            item.update(kind="local", detail="同源", mixed_content=False)
+            item.update(kind="local", detail="同源", engine=False)
             return item
         kind, detail = await _aio.to_thread(_probe_server, url)
         item.update(kind=kind, detail=detail,
-                    # 页面走 https 时，http:// 的远端会被浏览器直接拒绝
-                    mixed_content=url.startswith("http://"))
+                    # 配了 engine 的机器只借算力，任务/点读仍在本机
+                    engine=bool(_engine_config(s["name"])))
         return item
 
     out = await _aio.gather(*[one(s) for s in raw])
@@ -3215,7 +3354,8 @@ _silent_run = {}            # port -> consecutive silent sentence count (under _
 _silent_last_stop = {}      # port -> epoch of last silent-triggered reload
 
 
-def _synthesize_batch_stream(texts, voice, speed, model_key, on_item, deadline=None):
+def _synthesize_batch_stream(texts, voice, speed, model_key, on_item,
+                             deadline=None, engine=None):
     """一次请求提交整段句子，**收到一句就回调一句**（on_item(seq_index, wav)）。
 
     后端 /tts_batch_stream 是动态接活的流式接口：槽位一空就补下一句，每句
@@ -3226,6 +3366,8 @@ def _synthesize_batch_stream(texts, voice, speed, model_key, on_item, deadline=N
     """
     if not texts or len(texts) < 2:
         return None
+    if engine:
+        return None            # 引擎模式：退回静态批 /tts_batch（远端没有动态接活协议）
     key = _resolve_model_key(model_key)
     profile = MODEL_PROFILES[key]
     v = VOICES.get(voice, VOICES["default"])
@@ -3295,7 +3437,7 @@ def _synthesize_batch_stream(texts, voice, speed, model_key, on_item, deadline=N
         _release_port(port)
 
 
-def _synthesize_batch(texts, voice, speed, model_key=None):
+def _synthesize_batch(texts, voice, speed, model_key=None, engine=None):
     """一次请求合成多句（同一种 text_lang），逐句返回 WAV 字节；不可用时 None。
 
     长文的瓶颈是逐句串行的自回归解码：后端是单进程、请求串行的，一句一请求
@@ -3308,6 +3450,8 @@ def _synthesize_batch(texts, voice, speed, model_key=None):
     都走这条退路 —— 批量只可能更快，不会更脆。"""
     if not texts or len(texts) < 2:
         return None
+    if engine:
+        return _engine_synth_batch(engine, texts, voice, speed)
     key = _resolve_model_key(model_key)
     profile = MODEL_PROFILES[key]
     v = VOICES.get(voice, VOICES["default"])
@@ -3377,7 +3521,7 @@ def _synthesize_batch(texts, voice, speed, model_key=None):
         _release_port(port)
 
 
-def _synthesize(text, voice, speed, pad_short=True, model_key=None):
+def _synthesize(text, voice, speed, pad_short=True, model_key=None, engine=None):
     """Synthesize one text chunk via backend, with OOM/timeout failover.
     Tries voice-affinity backend first; on hard failure (OOM/unreachable/
     timeout) that instance is stopped and the next healthy one is loaded.
@@ -3394,6 +3538,10 @@ def _synthesize(text, voice, speed, pad_short=True, model_key=None):
     paths handle a stubbornly-silent sentence by failing/skipping it instead,
     and keep the full same-instance retries (a re-sample is the same text —
     no continuity cost)."""
+    # 引擎模式：这一句交给远端池合成（本机只负责文本清洗、时间轴与落盘）
+    if engine:
+        return _engine_synth(engine, text, voice, speed)
+
     key = _resolve_model_key(model_key)
     profile = MODEL_PROFILES[key]
 
@@ -3541,12 +3689,13 @@ def _synthesize(text, voice, speed, pad_short=True, model_key=None):
 
 
 @app.post("/api/tts")
-def tts(req: TTSRequest):
+def tts(req: TTSRequest, request: Request):
     # NOTE: sync def (not async) — FastAPI runs sync endpoints in a thread pool,
     # so blocking requests.post here does NOT block other concurrent requests.
     # async def would serialize all requests on the event loop.
     voice = req.voice
     key = _resolve_model_key(req.version)
+    engine = _engine_config(_server_key(request))   # 选了「引擎型」服务器就走远端算力
     t0 = time.time()
     clean_text = _clean_text(req.text)  # drop unsupported chars (emojis etc)
     if not clean_text:
@@ -3559,11 +3708,12 @@ def tts(req: TTSRequest):
             speaker_wav = _get_cached_speaker(req.speaker, voice, req.speed, key)
             if speaker_wav is None:
                 speaker_text = f"{req.speaker}说"
-                speaker_wav = _synthesize(speaker_text, voice, req.speed, pad_short=False, model_key=key)
+                speaker_wav = _synthesize(speaker_text, voice, req.speed, pad_short=False,
+                                          model_key=key, engine=engine)
                 _cache_speaker(req.speaker, voice, req.speed, speaker_wav, key)
 
         # Text audio (always generated, with failover handled inside)
-        text_wav = _synthesize(clean_text, voice, req.speed, model_key=key)
+        text_wav = _synthesize(clean_text, voice, req.speed, model_key=key, engine=engine)
         text_wav = _trim_silence(text_wav)  # cut vocoder head/tail padding
 
         # Merge: speaker + text
@@ -3597,14 +3747,23 @@ class LongTTSRequest(BaseModel):
 
 
 @app.post("/api/tts/long")
-def tts_long(req: LongTTSRequest):
+def tts_long(req: LongTTSRequest, request: Request):
     """Start async long-text synthesis. Returns the task id — the credential."""
     key = _resolve_model_key(req.version)
+    engine = _engine_config(_server_key(request))
     task_id = _new_task(req.text, req.voice, req.speed, key)
+    if engine:
+        # 任务本体仍在本机（分句/进度/点读/断点续传都不变），只有合成发给远端
+        with _tts_tasks_lock:
+            _tts_tasks[task_id]["engine"] = engine["name"]
+        logger.info("Long-text task %s uses engine %s (%s)",
+                    task_id, engine["name"], engine["url"])
     threading.Thread(target=_run_long_task,
                      args=(task_id, req.text, req.voice, req.speed, key),
+                     kwargs={"engine": engine},
                      daemon=True).start()
-    return {"task_id": task_id, "version": key}
+    return {"task_id": task_id, "version": key,
+            "engine": engine["name"] if engine else ""}
 
 
 @app.get("/api/tts/progress/{task_id}")

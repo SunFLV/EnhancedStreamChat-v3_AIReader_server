@@ -159,4 +159,15 @@ servers:
     desc: "这台机器（同源）"
   - name: "9070XT (streaming6)"
     url: "http://streaming6.sunflv.top:9881"
-    desc: "纯池 API（cuda×4），需另有代理层"
+    desc: "池 API（cuda×4）· 长文用它的算力"
+    # engine: 长文任务仍然全部在本机（分句/进度/点读/断点续传），只是每一句
+    # 的合成请求发给这台池，实测 4 句一批 2.8 s（本机约 10~15 s/句）。
+    # 远端没有本机那些音色，只能按名字映射；没配映射的音色走 default_voice。
+    engine:
+      api_key: "bsai-3c0fe1662944087cc0aa8505"
+      default_voice: "sunflv_phone"
+      # 远端只有两段参考音。sunflv_fire 是「火海般的恨意」那种情绪句，
+      # 念中性/短句容易变成气声（实测 gRMS 0.002），所以默认全部映射到
+      # sunflv_phone；想用火海音色可以自己加一行 v4_sunflv: sunflv_fire。
+      voice_map:
+        v4_sunflv: sunflv_phone
