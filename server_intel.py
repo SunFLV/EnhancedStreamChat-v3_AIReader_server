@@ -671,13 +671,16 @@ def _load_tasks_from_disk():
                 meta["wav"] = wav_path.read_bytes()
                 _tts_tasks[task_id] = meta
             elif meta.get("status") in ("running", "queued") or (
-                    meta.get("status") == "error"
-                    and meta.get("done", 0) > 0
-                    and meta.get("done", 0) < meta.get("total", 0)):
+                    meta.get("status") == "error" and meta.get("done", 0) > 0):
                 # Crash recovery: resume from where we left off. "error" tasks
-                # with partial progress were aborted mid-run by a transient
-                # failure (e.g. backend read timeout), not rejected by the
-                # user — resume them the same as "running".
+                # with any progress were aborted mid-run by a transient failure
+                # (e.g. backend read timeout), not rejected by the user — resume
+                # them the same as "running".
+                # 关键：done == total 也必须恢复 —— 所有片段都合成好了、但服务在
+                # 「合并整章 + 保存 wav」之前重启时，任务会带着 done==total 落成
+                # error（旧条件 0<done<total 把它永远卡死在 "Proxy restarted"）。
+                # _run_long_task 在 start==total 时会跳过合成、直接从磁盘读片段
+                # 合并，正是这里需要的收尾路径。
                 meta["wav"] = None
                 meta["status"] = "running"
                 _tts_tasks[task_id] = meta
