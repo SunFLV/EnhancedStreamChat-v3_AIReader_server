@@ -1773,11 +1773,16 @@ def _engine_synth(eng, text, voice, speed, pad_short=True):
             payload = {"text": variant, "speed_factor": speed,
                        "sample_steps": 4, "media_type": "wav",
                        "text_lang": _pick_lang(variant, default_lang),
-                       # 池默认 cut5 会把一句切成多段；纯英文的开头短段（如
-                       # "Shields are up!"）在 T2S 阶段 immediate-EOS → 静音，
-                       # 但整句其余段有声，静检测抓不到，表现就是开头几个词
-                       # 被吞掉。和 /tts_batch 保持一致，强制 cut0 整句合成。
-                       "text_split_method": "cut0"}
+                       # 池 /tts 默认 cut5 会把一句切成多段；与 /tts_batch 一致
+                       # 强制 cut0 整句合成。
+                       "text_split_method": "cut0",
+                       # 关键：池默认 seed=-1（随机）。SunFLV_v4-e15 + v5turbo
+                       # 对英文/混合文本极不稳：多数 seed 在 ~240 token 提前
+                       # EOS，把开头的短句吞掉（如 "Shields are up!" 整段消失），
+                       # 只有 seed=42 这类能跑满 343 token 读全。实测：
+                       # -1→4.2s(吞) / 0→4.4s(吞) / 1→3.9s(吞) / 42→8.2s(全)。
+                       # 固定 42，和本机 benchmark / 长文前端一致。
+                       "seed": 42}
             if v:
                 payload["voice"] = v
             try:
@@ -1817,7 +1822,7 @@ def _engine_synth_batch(eng, texts, voice, speed):
         return out
     payload = {"texts": list(texts), "speed_factor": speed, "sample_steps": 4,
                "text_split_method": "cut0", "batch_size": len(texts),
-               "media_type": "wav", "text_lang": langs[0]}
+               "media_type": "wav", "text_lang": langs[0], "seed": 42}
     v = _engine_voice(eng, voice)
     if v:
         payload["voice"] = v
