@@ -929,6 +929,13 @@ def _split_sentences(text):
     SHORT_CORE = 6  # post-clean speakable core ≤ this must not stand alone
 
     def _too_short(s):
+        # 纯英文短句（如 "Shields are up!"）不能并进后一句：v5turbo 对
+        # 15 字符以内的英文短句会 immediate-EOS → 0.24s 静音；合并后静音
+        # 混在长句音频里，整句静音检测抓不到，表现就是开头几个词消失。
+        # 让它独立成句，_synth_one 的 padding 兜底（重复一遍→1.6s 有声）接住。
+        # 中文短句仍按原逻辑合并（中文短句本身能正常合成）。
+        if _pick_lang(s, 'zh') == 'en':
+            return False
         return _core_speak_len(s) <= SHORT_CORE
 
     def _glue(a, b):
@@ -1752,6 +1759,14 @@ def _engine_synth(eng, text, voice, speed, pad_short=True):
         if v and v not in cands:
             cands.append(v)
     cands = cands[:2] or [""]
+    # 语言按句判定后传给池。池默认 text_lang=zh，纯英文句塞进中文前端会出问题。
+    default_lang = VOICES.get(voice, VOICES["default"]).get("text_lang", "zh")
+    # 英文短句（core<=8）无条件 padding：v5turbo 对 15 字符以内的英文短句
+    # 会 immediate-EOS 吐 0.24s 静音（"Shields are up!" 实测），重复一遍变成
+    # "Shields are up，Shields are up。" 就有 1.6s 有声。长文路径 pad_short=False
+    # 也要兜这个底 —— 分句独立后仍是静音，必须在 variants 构造前就决定。
+    if _pick_lang(text, default_lang) == 'en' and 0 < _core_speak_len(text) <= 8:
+        pad_short = True
     variants = [text]
     if pad_short:
         padded = _pad_short_text(text)
@@ -1763,10 +1778,6 @@ def _engine_synth(eng, text, voice, speed, pad_short=True):
                 padded = f"{body}，{body}。"
         if padded != text:
             variants.append(padded)
-    # 语言必须跟本机路径一样按句判定后传给池。池默认 text_lang=zh，
-    # 纯英文句子被塞进中文前端时 GPT 会吞掉开头短段（实测 “Shields are
-    # up!We apologize…” 只读出后半句）。池端 _base_inputs 支持客户端覆盖。
-    default_lang = VOICES.get(voice, VOICES["default"]).get("text_lang", "zh")
     last_err = ""
     for v in cands:
         for variant in variants:
