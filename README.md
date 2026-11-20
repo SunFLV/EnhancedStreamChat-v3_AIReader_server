@@ -297,6 +297,48 @@ servers:
 - 实测（本地 A770 vs 9070XT 池）：4 句长文 **3 s** 完成（本机约 40~60 s），
   单句 1.7 s（本机约 10 s）
 
+本机新加的 P106-90 3G 也按同样方式接入，名字是 `v5Turbo_INT8 NVIDIA`：
+
+```yaml
+  - name: "v5Turbo_INT8 NVIDIA"
+    url: "http://127.0.0.1:9891"
+    desc: "P106-90 3G · CUDA / v5Turbo INT8 权重（省显存）"
+    engine:
+      api_key: "bsai-..."
+      default_voice: "v4_phone"
+```
+
+池服务用单独的 `runtime_cuda`（torch 2.5.1+cu121）和量化后的
+`s2Gv5turbo_int8.pth`，单实例、`pool_size: 1`；启动脚本是后端根目录的
+`start_nvidia_int8.bat`。P106 是 sm_61、没有 Tensor Core，INT8 在这里只省显存、
+不提速；实测加载后约 1.4 GiB allocated / 2.0 GiB reserved。
+
+对照基准（40 字中文 / seed 42 / 4 步 / 预热后 3 次均值，`bench_int8_cards.py`）：
+
+| 配置 | 平均耗时 | RTF |
+|---|---|---|
+| P106-90 INT8 | 8.56 s | 1.04 |
+| P106-90 fp16 | 8.30 s（峰值 reserved 2564 MiB，贴近 3 GiB 上限） | 1.01 |
+| A770 原版 fp16 | 18.57 s | 2.25 |
+| A770 INT8 | 18.51 s（±0.3% 持平，无收益） | 2.25 |
+
+结论：A770 上 INT8 没有速度收益、显存也不缺；而且 A770/XPU 本身比
+P106 慢一倍以上（瓶颈是 CPU 侧 kernel launch ~84 µs/次，CUDA 只有 ~3 µs，
+v5Turbo 大量小算子的负载正好踩坑）。因此 **A770/XPU 已停用合成**：
+`config_intel.yaml` 给本机条目设了 `no_synth: true`，前端勾选框禁用、
+后端也不再回退到 XPU。本机代理进程仍在（任务/进度/点读/网页都靠它），
+只是不再当合成单元。P106 现切 fp16（3 GiB 塞得下、比 INT8 快 3%），
+是唯一合成后端。
+
+
+> 电话参考音（`v4_phone`）在 P106 上对 3~8 个字的短句会直接返回 0.24 s 静音。
+> 引擎路径检测到静音后会把短句重复一遍再合成（如 `最终验证。` →
+> `最终验证，最终验证。`）；`名字说` 这种说话人前缀失败则自动跳过，不会拖垮正文。
+
+> `start_addon.bat` 会显式设置 `NO_PROXY=127.0.0.1,localhost,::1`。如果系统里
+> 配了 HTTP 代理，不加这一句会让服务器探测把 9891 误判成 `offline`（请求被
+> 代理转发到本机端口后失败），长文引擎请求也会连不上。
+
 **模型列表不是写死的**：服务端启动时会读
 
 1. 后端根目录的 `BSAI_PATCH.json`（Patcher 装完补丁自动写的能力清单）

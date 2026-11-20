@@ -27,6 +27,11 @@ logging.basicConfig(level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("tts-proxy")
 
+# 本机回环地址永远不能走系统 HTTP 代理：否则 /api/servers 会把 9891 的
+# NVIDIA 池误判成 offline，引擎合成请求也连不上。放在代码里，手动启动也生效。
+os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost,::1")
+os.environ.setdefault("no_proxy", "127.0.0.1,localhost,::1")
+
 # ── Config ───────────────────────────────────────────────────────
 SCRIPT_DIR = Path(__file__).parent.absolute()
 # 独立附加包模式：解压到后端根目录后，后端就是 SCRIPT_DIR 的父目录。
@@ -926,13 +931,31 @@ def _split_sentences(text):
     def _too_short(s):
         return _core_speak_len(s) <= SHORT_CORE
 
+    def _glue(a, b):
+        """拼接短句碎片；字母/数字边界补空格，避免 `up!We` 这种粘连。
+
+        GPT-SoVITS 的英文前端遇到 `!W` 这种「标点紧跟字母」会把前一段吞掉
+        （实测 “Shields are up!We apologize…” 只读出后半句）。中文标点后不
+        需要空格，所以只在两侧都是 ASCII 可见字符且右侧是字母/数字时补。
+        """
+        if (a and b and 0x21 <= ord(a[-1]) <= 0x7E
+                and 0x21 <= ord(b[0]) <= 0x7E and b[0].isalnum()):
+            return a + " " + b
+        return a + b
+
+    def _glue_all(items):
+        out = ""
+        for x in items:
+            out = _glue(out, x)
+        return out
+
     # Pass 1 — a too-short fragment joins its (long) predecessor. Consecutive
     # shorts keep folding back into that same predecessor, so “…。好。嗯。”
     # collapses into one speakable sentence instead of a silent 1-char tail.
     merged = []
     for s in sents:
         if merged and _too_short(s):
-            merged[-1] += s
+            merged[-1] = _glue(merged[-1], s)
         else:
             merged.append(s)
 
@@ -944,16 +967,16 @@ def _split_sentences(text):
     for s in merged:
         if pending and not _too_short(s):
             pending.append(s)
-            s = "".join(pending)
+            s = _glue_all(pending)
             pending = []
         if _too_short(s):
             pending.append(s)
         else:
             result.append(s)
     if pending:
-        tail = "".join(pending)
+        tail = _glue_all(pending)
         if result:
-            result[-1] += tail
+            result[-1] = _glue(result[-1], tail)
         else:
             result.append(tail)
     merged = result
@@ -1183,10 +1206,14 @@ def _new_task(text, voice, speed, model_key=None):
     return task_id
 
 
-def _run_long_task(task_id, text, voice, speed, model_key=None, engine=None):
+def _run_long_task(task_id, text, voice, speed, model_key=None, engines=None):
     """Background worker: synthesize each sentence, merge, store result.
     Supports crash recovery — each completed sentence is persisted to disk
-    (fragment WAV + progress), so a restart resumes from the last sentence."""
+    (fragment WAV + progress), so a restart resumes from the last sentence.
+
+    engines: 勾选的合成单元列表（None=本机，dict=远端引擎）。None/[] 等价于
+    [None]（只用本机，与旧行为一致）；多元素时长文按句 round-robin 分摊并行。
+    """
     key = _resolve_model_key(model_key)
     ctl = _task_ctl(task_id)
     try:
@@ -1240,21 +1267,28 @@ def _run_long_task(task_id, text, voice, speed, model_key=None, engine=None):
 
         # 每句最多重试次数。引擎模式下远端要么很快失败、要么整台挂了，
         # 10 次 × 超时只会让用户干等；3 次足够确认「这台不可用」。
-        MAX_RETRIES = 3 if engine else 10
+        units = list(engines) if engines else [None]
+        MAX_RETRIES = 3 if any(u is not None for u in units) else 10
         last_error = {"msg": ""}
+
+        def _unit_for(i):
+            """第 i 句（0 基）归哪个单元：round-robin，负载均匀。"""
+            return units[i % len(units)] if len(units) > 1 else units[0]
 
         def _synth_one(text, i):
             """单句合成（带重试）。批处理失败时的回退路径。
 
             彻底失败时返回 None，并把原因记在 last_error 里 —— 调用方会因此
             把整个任务标成 error，而不是「跳过这句、当作完成」。
+            重试时 round-robin 换单元：本机挂了换引擎、引擎挂了换本机。
             """
             for attempt in range(MAX_RETRIES):
                 if ctl["cancel"].is_set():
                     raise _TaskCancelled()
                 try:
                     wav = _synthesize(text, voice, speed, pad_short=False, model_key=key,
-                                      engine=engine)
+                                      engine=_unit_for(i) if attempt == 0
+                                      else units[attempt % len(units)])
                     if wav:
                         return wav
                 except HTTPException as e:
@@ -1342,11 +1376,8 @@ def _run_long_task(task_id, text, voice, speed, model_key=None, engine=None):
 
             committed = set()
 
-            def _on_item(seq, wav):
-                """后端每算好一句就回调：立刻落盘 + 推进「连续完成前缀」。"""
-                gi = group[seq][0]
-                _commit(gi, wav)
-                committed.add(gi)
+            def _advance_done():
+                """推进「连续完成前缀」：done 指向第一句未完成的下标。"""
                 d = group[0][0]
                 while d in committed:
                     d += 1
@@ -1356,14 +1387,89 @@ def _run_long_task(task_id, text, voice, speed, model_key=None, engine=None):
                     if len(committed) % 4 == 0:
                         _save_task(task_id, dict(_tts_tasks[task_id]))
 
-            if len(group) > 1:
-                got = (_synthesize_batch_stream([t for _, t in group], voice, speed, key, _on_item,
-                                                 engine=engine)
-                       if DYNAMIC_BATCH else None)
+            def _on_item(seq, wav):
+                """后端每算好一句就回调：立刻落盘 + 推进「连续完成前缀」。"""
+                gi = group[seq][0]
+                _commit(gi, wav)
+                committed.add(gi)
+                _advance_done()
+
+            def _unit_synth(unit, part):
+                """一个合成单元负责一小段句子；返回 {全局句下标: wav}。
+
+                本机：动态流式批量（每句算好就回调），失败退一次性批量；
+                引擎：/tts_batch 静态批（内部已带逐句回退）。
+                没拿到的句子（静音/失败）由调用方统一逐句补。
+                """
+                out = {}
+                texts = [t for _, t in part]
+                if unit is None and len(part) > 1:
+                    got = (_synthesize_batch_stream(
+                               texts, voice, speed, key,
+                               lambda seq, wav: out.__setitem__(part[seq][0], wav))
+                           if DYNAMIC_BATCH else None)
+                    if got is None:
+                        wavs = _synthesize_batch(texts, voice, speed, model_key=key)
+                        if wavs is None:
+                            wavs = [None] * len(part)
+                        for (gi, _t), w in zip(part, wavs):
+                            if w:
+                                out[gi] = w
+                    return out
+                if unit is not None and len(part) > 1:
+                    wavs = _engine_synth_batch(unit, texts, voice, speed)
+                    if wavs:
+                        for (gi, _t), w in zip(part, wavs):
+                            if w:
+                                out[gi] = w
+                    return out
+                for gi, t in part:            # 单句单元：直接逐句
+                    w = _synth_one(t, gi)
+                    if w:
+                        out[gi] = w
+                return out
+
+            if len(units) > 1:
+                # 多后端并行：这一组句子按 round-robin 分给各单元，每个单元
+                # 自己决定流式批/静态批；join 后按 committed 统一推进与补漏。
+                parts = [[] for _ in units]
+                for off, (gi, t) in enumerate(group):
+                    parts[off % len(units)].append((gi, t))
+                got_map = {}
+                unit_errs = []
+
+                def _unit_worker(unit, part):
+                    try:
+                        got_map.update(_unit_synth(unit, part))
+                    except Exception as e:            # 单元整体失败：留给逐句补
+                        unit_errs.append(e)
+                        logger.warning("Long-text: unit %s batch failed: %s",
+                                       "本机" if unit is None else unit.get("name"), e)
+
+                threads = []
+                for unit, part in zip(units, parts):
+                    if part:
+                        th = threading.Thread(target=_unit_worker, args=(unit, part),
+                                              daemon=True)
+                        th.start()
+                        threads.append(th)
+                for th in threads:
+                    th.join()
+                for gi, w in sorted(got_map.items()):
+                    if w:
+                        _commit(gi, w)
+                        committed.add(gi)
+                if unit_errs and not committed:
+                    last_error["msg"] = str(unit_errs[0])
+                _advance_done()
+            elif len(group) > 1:
+                unit = units[0]
+                got = (_synthesize_batch_stream([t for _, t in group], voice, speed, key, _on_item)
+                       if unit is None and DYNAMIC_BATCH else None)
                 if got is None:
                     # 流式不可用（老后端/报错）→ 退回一次性批量，再不行逐句
                     wavs = _synthesize_batch([t for _, t in group], voice, speed,
-                                             model_key=key, engine=engine)
+                                             model_key=key, engine=unit)
                     if wavs is None:
                         wavs = [_synth_one(t, gi) for gi, t in group]
                     elif any(w is None for w in wavs):
@@ -1374,11 +1480,13 @@ def _run_long_task(task_id, text, voice, speed, model_key=None, engine=None):
                         if wav:
                             _commit(gi, wav)
                             committed.add(gi)
+                _advance_done()
             else:
                 wav = _synth_one(group[0][1], group[0][0])
                 if wav:
                     _commit(group[0][0], wav)
                     committed.add(group[0][0])
+                _advance_done()
 
             # 流式里被判静音、或整批失败漏掉的句子：逐句补
             for gi, gt in group:
@@ -1489,8 +1597,12 @@ def _server_key(request):
 
 
 def _server_by_key(raw):
-    """_srv（下标或服务器名）→ config 里的那台。指向本机时返回 None。"""
-    if raw in (None, "", "0", "local"):
+    """_srv（下标或服务器名）→ config 里的那台；无匹配返回 None。
+
+    注意：本机条目已从 servers 移除，下标 0 就是第一台真正的合成引擎（P106）。
+    「local」这个旧别名仍映射到本机（无后端），只为兼容老 API 调用。
+    """
+    if raw in (None, "", "local"):
         return None
     servers = [s for s in (config.get("servers") or [])
                if isinstance(s, dict) and s.get("name")]
@@ -1505,6 +1617,59 @@ def _selected_remote(request):
     picked = _server_by_key(_server_key(request))
     url = str((picked or {}).get("url") or "").rstrip("/")
     return (url, picked.get("name")) if url else None
+
+
+def _server_keys(request):
+    """勾选的服务器键列表：_srv=0,2（逗号多选）或同名混写，去重保序。"""
+    out = []
+    for part in str(_server_key(request) or "").split(","):
+        part = part.strip()
+        if part and part not in out:
+            out.append(part)
+    return out
+
+
+def _selected_units(request):
+    """勾选的全部「合成引擎」，按勾选顺序。
+
+    本机已不再是合成单元（A770/XPU 停用）：servers 里全是引擎，
+    本机代理只负责网页/任务/进度/点读/合并音频。
+
+    - 没带 _srv            → 默认第一台引擎（P106），兼容旧客户端
+    - 只勾一台             → 单元素列表
+    - 勾多台               → 长文按句 round-robin 分摊并行合成
+    - 勾了「没配 engine:」的远端 → 忽略（单选时仍走完整转发语义）
+    """
+    units = []
+    for k in _server_keys(request):
+        if k == "local":
+            continue              # 旧别名：本机已不合成
+        eng = _engine_config(k)
+        if eng is None:
+            continue              # 没配 engine: / 不存在：借不到算力
+        if any(u.get("name") == eng.get("name") for u in units):
+            continue
+        units.append(eng)
+    if units:
+        return units
+    # 没带 _srv（旧客户端）：默认第一台引擎，优先本机直连的 P106
+    if not _server_keys(request):
+        servers = [s for s in (config.get("servers") or [])
+                   if isinstance(s, dict) and s.get("name")]
+        ordered = sorted(servers, key=lambda s: 0 if str(s.get("url") or "").startswith(
+                         ("http://127.0.0.1", "http://localhost")) else 1)
+        for s in ordered:
+            eng = _engine_config(s["name"])
+            if eng:
+                return [eng]
+    return []                     # 显式选了不可用的：接口层报错
+
+
+def _unit_names(units):
+    """勾选引擎的可读名字：P106-90 + 9070XT …。"""
+    if not units:
+        return "（无可用后端）"
+    return " + ".join((u.get("name") or "?") for u in units)
 
 
 def _engine_config(raw):
@@ -1573,43 +1738,86 @@ def _engine_voice(eng, voice):
     return eng.get("default_voice") or ""
 
 
-def _engine_synth(eng, text, voice, speed):
+def _engine_synth(eng, text, voice, speed, pad_short=True):
     """单句走远端池的 POST /（直接回 audio/wav）。
 
     远端的参考音不一定适配所有文本（实测「火海句」那种情绪参考音念短句会
     念成气声），所以映射到的音色出静音时，自动退到 default_voice 再试一次。
+    P106 + 电话参考音对 3 个字以内的句子会直接吐 0.24s 静音；此时按本机
+    danmaku 路径的老办法把核心词重复到 4 字再试一次（pad_short=False 的长文
+    说话人前缀不做改写，由调用方决定跳过）。
     """
     cands = []
     for v in (_engine_voice(eng, voice), eng.get("default_voice"), *(eng.get("voices") or [])):
         if v and v not in cands:
             cands.append(v)
     cands = cands[:2] or [""]
+    variants = [text]
+    if pad_short:
+        padded = _pad_short_text(text)
+        if padded == text:
+            # 电话/情绪参考音对 4~8 个字也经常直接静音。只在首轮真的静音后
+            # 才用重复句再试一次，正常长句不会走到这里。
+            body = text.strip().rstrip("。！？!?；;，,、…—- ")
+            if 0 < _core_speak_len(body) <= 8:
+                padded = f"{body}，{body}。"
+        if padded != text:
+            variants.append(padded)
+    # 语言必须跟本机路径一样按句判定后传给池。池默认 text_lang=zh，
+    # 纯英文句子被塞进中文前端时 GPT 会吞掉开头短段（实测 “Shields are
+    # up!We apologize…” 只读出后半句）。池端 _base_inputs 支持客户端覆盖。
+    default_lang = VOICES.get(voice, VOICES["default"]).get("text_lang", "zh")
     last_err = ""
     for v in cands:
-        payload = {"text": text, "speed_factor": speed,
-                   "sample_steps": 4, "media_type": "wav"}
-        if v:
-            payload["voice"] = v
-        try:
-            r = requests.post(eng["url"] + "/", headers=_engine_headers(eng),
-                              json=payload, timeout=(5, 900))
-        except requests.exceptions.RequestException as e:
-            raise HTTPException(502, f"无法连接合成引擎「{eng['name']}」: {e}")
-        if r.status_code != 200:
-            last_err = f"HTTP {r.status_code}: {r.text[:160]}"
-            continue
-        if r.content and not _is_silent_wav(r.content):
-            return r.content
-        last_err = f"音色 {v or '(默认)'} 返回静音"
-        logger.warning("Engine %s silent with voice=%s for %r", eng["name"], v, text[:20])
+        for variant in variants:
+            payload = {"text": variant, "speed_factor": speed,
+                       "sample_steps": 4, "media_type": "wav",
+                       "text_lang": _pick_lang(variant, default_lang),
+                       # 池默认 cut5 会把一句切成多段；纯英文的开头短段（如
+                       # "Shields are up!"）在 T2S 阶段 immediate-EOS → 静音，
+                       # 但整句其余段有声，静检测抓不到，表现就是开头几个词
+                       # 被吞掉。和 /tts_batch 保持一致，强制 cut0 整句合成。
+                       "text_split_method": "cut0"}
+            if v:
+                payload["voice"] = v
+            try:
+                r = requests.post(eng["url"] + "/", headers=_engine_headers(eng),
+                                  json=payload, timeout=(5, 900))
+            except requests.exceptions.RequestException as e:
+                raise HTTPException(502, f"无法连接合成引擎「{eng['name']}」: {e}")
+            if r.status_code != 200:
+                last_err = f"HTTP {r.status_code}: {r.text[:160]}"
+                continue
+            if r.content and not _is_silent_wav(r.content):
+                if variant != text:
+                    logger.warning("Engine %s padded short text %r -> %r",
+                                   eng["name"], text[:20], variant[:20])
+                return r.content
+            last_err = f"音色 {v or '(默认)'} 返回静音"
+            logger.warning("Engine %s silent with voice=%s for %r", eng["name"], v, variant[:20])
     raise HTTPException(502, f"引擎「{eng['name']}」合成失败：{last_err}")
 
 
 def _engine_synth_batch(eng, texts, voice, speed):
-    """一批句子走远端池的 /tts_batch，按序返回逐句 WAV；不可用时 None。"""
+    """一批句子走远端池的 /tts_batch，按序返回逐句 WAV；不可用时 None。
+
+    池的 /tts_batch 一次请求只能带一个 text_lang；批内语言混杂时退回逐句
+    _engine_synth（每句自带按 _pick_lang 判定的 text_lang），否则纯英文句
+    会被中文前端吞掉开头。
+    """
+    default_lang = VOICES.get(voice, VOICES["default"]).get("text_lang", "zh")
+    langs = [_pick_lang(t, default_lang) for t in texts]
+    if len(set(langs)) > 1:
+        out = []
+        for t in texts:
+            try:
+                out.append(_engine_synth(eng, t, voice, speed))
+            except HTTPException:
+                out.append(None)
+        return out
     payload = {"texts": list(texts), "speed_factor": speed, "sample_steps": 4,
                "text_split_method": "cut0", "batch_size": len(texts),
-               "media_type": "wav"}
+               "media_type": "wav", "text_lang": langs[0]}
     v = _engine_voice(eng, voice)
     if v:
         payload["voice"] = v
@@ -1659,6 +1867,10 @@ async def _forward_to_selected_server(request: Request, call_next):
 
     target = _selected_remote(request)
     if not target:
+        return await call_next(request)
+    if len(_server_keys(request)) > 1:
+        # 多选模式：合成/任务全在本机处理（按句分摊给各引擎），元数据也用
+        # 本机的那套 —— 转发没有意义，还会把 /api/voices 指到其中一台。
         return await call_next(request)
     if _engine_config(_server_key(request)) and path not in _ENGINE_META:
         return await call_next(request)       # 引擎模式：只转发能力查询
@@ -1873,10 +2085,14 @@ audio { width:100%; }
 input[type=file] { width:100%; font-size:12.5px; color:#aaa; margin-top:4px; }
 input[type=color] { width:38px; height:26px; padding:0; border:none; background:none;
                     cursor:pointer; vertical-align:middle; }
-/* 服务器选择器（下拉项由后端 /api/servers 提供，配置驱动） */
+/* 服务器选择器（勾选框由后端 /api/servers 提供，配置驱动；可多选分摊长文） */
 .srv-wrap { display:inline-flex; align-items:center; gap:5px; white-space:nowrap;
             font-size:12.5px; color:#aaa; }
-#serverPick { max-width:150px; padding:4px 8px; font-size:12.5px; cursor:pointer; }
+.srv-list { display:inline-flex; flex-wrap:wrap; gap:2px 12px; max-width:460px; }
+.srv-list label { display:inline-flex; align-items:center; gap:4px; cursor:pointer;
+                  font-size:12.5px; color:#ccc; white-space:nowrap; }
+.srv-list input { accent-color:#7c3aed; cursor:pointer; margin:0; }
+.srv-list label.off { opacity:.45; }
 </style>
 </head>
 <body>
@@ -1888,8 +2104,8 @@ input[type=color] { width:38px; height:26px; padding:0; border:none; background:
       <button class="tab-btn" id="tabRead">点读</button>
     </div>
     <span class="spacer"></span>
-    <label class="srv-wrap" title="切换 TTS 服务器（列表来自服务端配置）">
-      🖥 <select id="serverPick"></select>
+    <label class="srv-wrap" title="勾选要使用的 TTS 后端（可多选：长文按句分摊并行合成，单句用第一个勾选的引擎）">
+      🖥 <span id="serverPick" class="srv-list"></span>
     </label>
   </div>
 
@@ -2005,28 +2221,34 @@ const voiceLong = $('voiceLong');
 const versionLong = $('versionLong');
 const longBtn = $('longBtn');
 
-// ── 服务器选择 ───────────────────────────────────────────────
-// 下拉项来自当前服务的 /api/servers（由 config_intel.yaml 的 servers: 驱动）。
-// 请求**永远发本机**（同源相对路径），用 _srv=<下标> 告诉服务端转发到哪台 ——
-// 这样跨域（CORS）和 https 页面里发 http 请求（混合内容）都不会发生。
-let srvBase = '';        // 仅用于界面显示，不再拼进请求地址
-let srvIdx = 0;
+// ── 服务器选择（勾选，可多选） ─────────────────────────────────
+// 勾选框来自本机的 /api/servers（由 config_intel.yaml 的 servers: 驱动）。
+// 请求**永远发本机**（同源相对路径），用 _srv=<下标,下标,…> 告诉服务端用哪些后端：
+//   · 只勾一台           → 行为与旧版单选完全一致
+//   · 勾本机 + 引擎      → 长文按句 round-robin 分摊到各后端并行合成
+//   · 单句 /api/tts      → 用第一个勾选的引擎（没勾引擎就走本机）
+let srvSel = new Set([0]);
 let serverList = [];
-// 所有 API/音频/事件流统一走这里：改一次服务器，全站请求跟着走。
+// 所有 API/音频/事件流统一走这里：改一次勾选，全站请求跟着走。
 function api(path) {
-  const s = serverList[srvIdx];
-  if (!s || !s.url) return path;                 // 本机：原样
-  return path + (path.includes('?') ? '&' : '?') + '_srv=' + srvIdx;
+  if (!srvSel.size) return path;                 // 理论上不会发生（至少勾一台）
+  return path + (path.includes('?') ? '&' : '?') + '_srv=' + [...srvSel].join(',');
+}
+
+function srvName() {
+  if (!serverList.length) return '本机';
+  const names = [...srvSel].map(i => (serverList[i] || {}).name || '本机');
+  return names.length ? names.join(' + ') : '本机';
 }
 
 async function loadServers() {
-  const sel = $('serverPick');
+  const box = $('serverPick');
   try {
     // 服务器列表永远从「当前页面所在的那台」拿，不然切成远端后会拿到远端的列表
     const r = await fetch('/api/servers', { cache: 'no-store' });
     const data = await r.json();
     serverList = data.servers || [];
-    // 每台后面标出探测结果：能不能直接切过去用，一眼可见
+    // 每台后面标出探测结果：能不能直接勾上去用，一眼可见
     const badge = s => {
       if (!s.kind || s.kind === 'local') return '';
       if (s.engine)             return ` ⚡ 合成引擎${s.detail ? ' · ' + s.detail : ''}`;
@@ -2036,57 +2258,98 @@ async function loadServers() {
       if (s.kind === 'offline') return ` ✕ 不可达`;
       return ` · ${s.detail || s.kind}`;
     };
-    sel.innerHTML = serverList.map((s, i) =>
-      `<option value="${i}">${s.name}${s.desc ? ' — ' + s.desc : ''}${badge(s)}</option>`).join('');
-    // 记住上次选择；配置改过导致下标失效时退回第一台
-    const saved = localStorage.getItem('bsai.server');
-    const idx = saved !== null && saved < serverList.length ? Number(saved) : 0;
-    sel.value = String(idx);
-    applyServer(idx, true);          // 首次：只设 base，不动播放器
+    const unusable = s => s.kind === 'offline' || s.no_synth;
+    box.innerHTML = serverList.map((s, i) =>
+      `<label class="${unusable(s) ? 'off' : ''}" `
+      + `title="${(s.desc || '')}${badge(s)}">`
+      + `<input type="checkbox" value="${i}"${unusable(s) ? ' disabled' : ''}> `
+      + `${s.name}${badge(s)}</label>`).join('');
+    // 恢复上次勾选。按「名字」存，不再存下标 —— 配置顺序一变（比如把 P106
+    // 提到第一位）下标就全错位。离线/不可用的剔除，全失效退回第一台可用引擎。
+    const firstUsable = serverList.findIndex(s => !unusable(s));
+    let saved = [];
+    try {
+      const names = JSON.parse(localStorage.getItem('bsai.servers') || 'null');
+      if (Array.isArray(names)) {
+        saved = names.map(n => serverList.findIndex(s => s.name === n))
+          .filter(i => i >= 0 && !unusable(serverList[i]));
+      }
+    } catch(_) {}
+    if (!saved.length) {
+      // 兼容旧版存的数字下标：只在指向有效且可用的引擎时才沿用
+      try {
+        const old = JSON.parse(localStorage.getItem('bsai.servers') || 'null');
+        if (Array.isArray(old) && old.every(n => Number.isInteger(n))) {
+          saved = old.filter(i => i >= 0 && i < serverList.length && !unusable(serverList[i]));
+        }
+      } catch(_) {}
+    }
+    if (!saved.length) {
+      // 旧版单选的迁移：bsai.server 还在就沿用那台（前提：仍可用于合成）
+      const old = localStorage.getItem('bsai.server');
+      if (old !== null && Number(old) < serverList.length && !unusable(serverList[Number(old)])) {
+        saved = [Number(old)];
+      } else {
+        saved = [firstUsable < 0 ? 0 : firstUsable];
+      }
+    }
+    srvSel = new Set(saved);
+    box.querySelectorAll('input').forEach(cb => { cb.checked = srvSel.has(Number(cb.value)); });
+    box.onchange = applySelection;
+    applySelection(true);          // 首次：只恢复勾选，不动播放器
   } catch(e) {
-    sel.innerHTML = '<option value="0">本机</option>';
-    applyServer(0, true);
+    box.innerHTML = '<label><input type="checkbox" value="0" checked> P106（未加载配置）</label>';
+    srvSel = new Set([0]);
+    box.onchange = applySelection;
+    applySelection(true);
   }
-  sel.onchange = () => applyServer(Number(sel.value), false);
 }
 
-function applyServer(idx, initial) {
-  const s = serverList[idx] || { url: '' };
-  // 请求都走本机转发，所以这里提示的是「选中这台之后哪些功能用不了」
-  if (!initial && s.url) {
-    if (s.kind === 'offline') {
-      status.textContent = `⚠ ${s.name} 探测不到（${s.detail || '连接失败'}），`
-        + `请求会返回 502。检查地址/服务是否启动。`;
-    } else if (s.engine) {
-      status.textContent = `⚡ 已切到 ${s.name}：长文/点读仍在本机，合成由它完成`
-        + `（音色会映射成它自己的参考音）。`;
-    } else if (s.kind === 'backend' || s.kind === 'pool') {
-      status.textContent = `ℹ 已切到 ${s.name}：合成由它完成，但它没有长文任务与点读接口`
-        + `（要完整功能需在那台部署 bsai 附加包）。`;
-    }
+function applySelection(initial) {
+  const box = $('serverPick');
+  box.querySelectorAll('input').forEach(cb => {
+    if (cb.disabled) { srvSel.delete(Number(cb.value)); return; }   // 离线不可勾
+    if (cb.checked) srvSel.add(Number(cb.value));
+    else srvSel.delete(Number(cb.value));
+  });
+  if (!srvSel.size) {              // 一个都不勾 = 没后端可用，强制勾回第一台
+    const first = box.querySelector('input');
+    if (first) { first.checked = true; srvSel = new Set([Number(first.value)]); }
   }
-  srvIdx = idx;
-  srvBase = String(s.url || '').replace(/\/+$/, '');   // 只用于显示
-  localStorage.setItem('bsai.server', String(idx));
+  localStorage.setItem('bsai.servers',
+    JSON.stringify([...srvSel].map(i => (serverList[i] || {}).name).filter(Boolean)));
   if (!initial) {
-    // 用户主动切换 = 换了一个后端：停播、重拉音色、重建事件流
+    // 勾选变化 = 后端组合变了：停播、重拉音色、重建事件流
     try { audio.pause(); } catch(_) {}
     player.style.display = 'none';
+    const units = [...srvSel].map(i => serverList[i]).filter(Boolean);
+    const engines = units.filter(s => s.engine && s.url);
+    const hasLocal = units.some(s => !s.url);
+    if (engines.length && hasLocal) {
+      status.textContent = `⚡ 已勾选 ${srvName()}：长文按句分摊并行合成，`
+        + `单句用 ${engines[0].name}。`;
+    } else if (engines.length) {
+      status.textContent = `⚡ 已勾选 ${srvName()}：合成由引擎完成，`
+        + `长文按勾选顺序分摊。`;
+    } else if (units.length === 1 && units[0].kind === 'offline') {
+      status.textContent = `⚠ ${units[0].name} 探测不到（${units[0].detail || '连接失败'}），`
+        + `请求会返回 502。检查地址/服务是否启动。`;
+    } else if (units.length === 1 && (units[0].kind === 'backend' || units[0].kind === 'pool')) {
+      status.textContent = `ℹ 已切到 ${units[0].name}：合成由它完成，但它没有长文任务与点读接口`
+        + `（要完整功能需在那台部署 bsai 附加包）。`;
+    }
   }
   loadVoices();
 }
 
-function srvName() {
-  const s = serverList[srvIdx];
-  return (s && s.name) || '本机';
-}
-
 async function loadVoices() {
-  // 音色和模型版本都是「每台服务器各自」的：请求照样发本机，由本机转发到
-  // 选中的那台（带 _srv）。拿不到就把选择器锁掉并说明原因，
+  // 音色和模型版本都是「每台服务器各自」的：请求照样发本机（带勾选列表）。
+  // 多选引擎模式下 /api/voices 由本机直接应答（引擎用的是本机音色映射表）；
+  // 单选远端时由本机转发到那台。拿不到就把勾选框锁掉并说明原因，
   // 免得用户以为还能用本地那套模型。
-  const picked = serverList[srvIdx];
-  const where = (picked && picked.name) || '本机';
+  const firstIdx = [...srvSel][0] || 0;
+  const picked = serverList[firstIdx];
+  const where = srvName();
   voiceLong.innerHTML = '<option>加载中…</option>';
   versionLong.innerHTML = '<option>加载中…</option>';
   try {
@@ -3091,7 +3354,7 @@ $('importBtn').onclick = async () => {
 
 buildSwatches();
 applyAppearance();
-loadServers();   // 读 /api/servers → 渲染下拉 → applyServer() 里会调 loadVoices()
+loadServers();   // 读 /api/servers → 渲染勾选框 → applySelection() 里会调 loadVoices()
 </script>
 </body>
 </html>
@@ -3249,7 +3512,8 @@ async def servers():
 
     async def one(s):
         url = str(s.get("url") or "")
-        item = {"name": s["name"], "url": url, "desc": s.get("desc", "")}
+        item = {"name": s["name"], "url": url, "desc": s.get("desc", ""),
+                "no_synth": bool(s.get("no_synth", False))}
         if not url:
             item.update(kind="local", detail="同源", engine=False)
             return item
@@ -3662,7 +3926,7 @@ def _synthesize(text, voice, speed, pad_short=True, model_key=None, engine=None)
     no continuity cost)."""
     # 引擎模式：这一句交给远端池合成（本机只负责文本清洗、时间轴与落盘）
     if engine:
-        return _engine_synth(engine, text, voice, speed)
+        return _engine_synth(engine, text, voice, speed, pad_short=pad_short)
 
     key = _resolve_model_key(model_key)
     profile = MODEL_PROFILES[key]
@@ -3817,7 +4081,12 @@ def tts(req: TTSRequest, request: Request):
     # async def would serialize all requests on the event loop.
     voice = req.voice
     key = _resolve_model_key(req.version)
-    engine = _engine_config(_server_key(request))   # 选了「引擎型」服务器就走远端算力
+    selected = _selected_units(request)
+    if not selected:
+        raise HTTPException(400, "所选后端不参与合成（本机 XPU 已停用），请勾选 P106 引擎")
+    engine = next((u for u in selected if u), None)
+    # 单句：用第一个勾选的引擎（本机+引擎都勾了就优先引擎，通常更快）。
+    # 本机条目被标记 no_synth 时 selected 为空，上面已明确拒绝，不再偷用 XPU。
     t0 = time.time()
     clean_text = _clean_text(req.text)  # drop unsupported chars (emojis etc)
     if not clean_text:
@@ -3830,9 +4099,16 @@ def tts(req: TTSRequest, request: Request):
             speaker_wav = _get_cached_speaker(req.speaker, voice, req.speed, key)
             if speaker_wav is None:
                 speaker_text = f"{req.speaker}说"
-                speaker_wav = _synthesize(speaker_text, voice, req.speed, pad_short=False,
-                                          model_key=key, engine=engine)
-                _cache_speaker(req.speaker, voice, req.speed, speaker_wav, key)
+                try:
+                    speaker_wav = _synthesize(speaker_text, voice, req.speed, pad_short=False,
+                                              model_key=key, engine=engine)
+                    _cache_speaker(req.speaker, voice, req.speed, speaker_wav, key)
+                except HTTPException as e:
+                    # 「名字说」只有 2~4 个字，弱卡（P106 等）容易直接吐静音；
+                    # 说话人前缀只是装饰，不能因为它把整句正文也一起判失败。
+                    logger.warning("Speaker prefix %r failed (%s) — continuing without it",
+                                   speaker_text, getattr(e, "detail", e))
+                    speaker_wav = None
 
         # Text audio (always generated, with failover handled inside)
         text_wav = _synthesize(clean_text, voice, req.speed, model_key=key, engine=engine)
@@ -3870,31 +4146,33 @@ class LongTTSRequest(BaseModel):
 
 @app.post("/api/tts/long")
 def tts_long(req: LongTTSRequest, request: Request):
-    """Start async long-text synthesis. Returns the task id — the credential."""
+    """Start async long-text synthesis. Returns the task id — the credential.
+
+    勾选多个后端时（_srv=0,2,…），长文按句 round-robin 分摊给各引擎并行合成；
+    分句/进度/点读/断点续传仍然全部在本机。"""
     key = _resolve_model_key(req.version)
-    engine = _engine_config(_server_key(request))
-    if engine:
-        _engine_preflight(engine)      # 连不上就直接 502，不建一个注定失败的任务
+    units = _selected_units(request)
+    if not units:
+        raise HTTPException(400, "所选后端不参与合成（本机 XPU 已停用），请勾选 P106 引擎")
+    for eng in [u for u in units if u]:
+        _engine_preflight(eng)      # 连不上就直接 502，不建一个注定失败的任务
     task_id = _new_task(req.text, req.voice, req.speed, key)
-    if engine:
-        # 任务本体仍在本机（分句/进度/点读/断点续传都不变），只有合成发给远端
-        with _tts_tasks_lock:
-            _tts_tasks[task_id]["engine"] = engine["name"]
-        logger.info("Long-text task %s uses engine %s (%s)",
-                    task_id, engine["name"], engine["url"])
+    with _tts_tasks_lock:
+        _tts_tasks[task_id]["engine"] = _unit_names(units)
+    if any(u is not None for u in units):
+        logger.info("Long-text task %s uses engines: %s", task_id, _unit_names(units))
     threading.Thread(target=_run_long_task,
                      args=(task_id, req.text, req.voice, req.speed, key),
-                     kwargs={"engine": engine},
+                     kwargs={"engines": units},
                      daemon=True).start()
-    return {"task_id": task_id, "version": key,
-            "engine": engine["name"] if engine else ""}
+    return {"task_id": task_id, "version": key, "engine": _unit_names(units)}
 
 
-def _restart_task(task_id, engine=None):
+def _restart_task(task_id, engines=None):
     """把一个中断/失败的任务重新拉起来：沿用原分句与已落盘片段，从断点续跑。
 
     任务身份（id / 分句 / 点读时间轴）完全不变，所以前端只要重新轮询同一个 id；
-    engine 用「重试那一刻选中的服务器」，换台机器重试也行。
+    engines 用「重试那一刻勾选的后端」，换台机器重试也行。
     """
     t = _get_task(task_id)
     if t.get("status") == "running":
@@ -3919,20 +4197,22 @@ def _restart_task(task_id, engine=None):
         resume = int(task.get("done", 0))
         total = int(task.get("total", 0))
     threading.Thread(target=_run_long_task, args=args,
-                     kwargs={"engine": engine}, daemon=True).start()
-    logger.info("Long-text task %s restarted from %d/%d (engine=%s)",
-                task_id, resume, total, (engine or {}).get("name", "本机"))
+                     kwargs={"engines": engines}, daemon=True).start()
+    logger.info("Long-text task %s restarted from %d/%d (engines=%s)",
+                task_id, resume, total, _unit_names(engines or [None]))
     return {"task_id": task_id, "resume_from": resume, "total": total,
-            "engine": (engine or {}).get("name", "")}
+            "engine": _unit_names(engines or [None])}
 
 
 @app.post("/api/tts/retry/{task_id}")
 def tts_retry(task_id: str, request: Request):
-    """重试一个失败的任务；合成走「当前选中的那台服务器」。"""
-    engine = _engine_config(_server_key(request))
-    if engine:
-        _engine_preflight(engine)
-    return _restart_task(task_id, engine)
+    """重试一个失败的任务；合成走「当前勾选的那些后端」。"""
+    units = _selected_units(request)
+    if not units:
+        raise HTTPException(400, "所选后端不参与合成（本机 XPU 已停用），请勾选 P106 引擎")
+    for eng in [u for u in units if u]:
+        _engine_preflight(eng)
+    return _restart_task(task_id, units)
 
 
 @app.post("/api/tts/pause/{task_id}")

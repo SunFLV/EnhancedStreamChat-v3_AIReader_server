@@ -168,9 +168,19 @@ default_voice: "v4_phone"
 forward_tls_verify: false
 
 servers:
-  - name: "本机 A770"
-    url: ""
-    desc: "这台机器（同源）"
+  # 本机 XPU/A770 合成已停用（实测只有 P106 的一半速度），本机条目整个去掉。
+  # 本机代理进程仍在，负责网页/任务/进度/点读/合并音频，只是不再是合成后端。
+  # 第 0 位 = P106：前端默认勾选它，旧客户端不带 _srv 时也默认走它。
+  - name: "P106-90 fp16 (CUDA)"
+    url: "http://127.0.0.1:9891"
+    desc: "P106-90 3G · CUDA / v5Turbo fp16（比 XPU 快一倍）"
+    engine:
+      api_key: "bsai-893c84f29fe484cab774d999d6caa1a4"
+      default_voice: "v4_phone"
+      # 池服务从本机 BSAI_VOICES.json 自报音色，这里保留一份显式映射，
+      # 方便以后换成别的参考音时不用改前端。
+      voice_map:
+        v4_sunflv: v4_phone
   - name: "9070XT (streaming6)"
     url: "http://streaming6.sunflv.top:9881"
     desc: "池 API（cuda×4）· 长文用它的算力"

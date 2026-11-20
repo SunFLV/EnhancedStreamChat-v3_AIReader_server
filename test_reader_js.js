@@ -131,6 +131,12 @@ const sandbox = {
       return { ok: true, status: 200, json: async () => ({ backends: [], events: [] }),
                text: async () => '' };
     }
+    // 服务器下拉框：返回一台同源机器；applyServer 会据此调 loadVoices()
+    if (url.includes('/api/servers')) {
+      return { ok: true, status: 200,
+               json: async () => ({ servers: [{ name: '本机', url: '', desc: '' }], current: '本机' }),
+               text: async () => '' };
+    }
     // 进度接口：由测试脚本逐段改写 PROGRESS 来驱动轮询链（第 14 节）
     if (url.includes('/api/tts/progress/')) {
       progressCalls++;

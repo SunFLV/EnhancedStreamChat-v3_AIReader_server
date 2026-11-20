@@ -1,29 +1,32 @@
 @echo off
 setlocal EnableExtensions
 rem ============================================================
-rem  AIReader 附加包启动器（不改原后端任何文件）
-rem  用法：把整个附加包目录解压到 GPT-SoVITS-For-Intel 根目录，
-rem        然后双击本文件（或从这里复制 start.cmd 到后端根目录运行）。
-rem  自动定位后端：本目录的父目录就是后端根目录（含 runtime\python.exe）。
+rem  AIReader addon launcher (does not touch the backend files)
+rem  Usage: extract the whole addon folder next to the backend
+rem  root (the parent of this folder must contain runtime\python.exe),
+rem  then run this file.
+rem  All-ASCII on purpose: cmd parses .bat with the OEM codepage,
+rem  so non-ASCII comments get mangled into garbage commands.
 rem ============================================================
 cd /d "%~dp0"
 
-rem 显式告诉代理后端在哪（也支持自动探测，这里给个保险）
+rem Tell the proxy where the backend lives (auto-detect works too)
 set "BSAI_BACKEND_DIR=%~dp0.."
 
-rem 配置文件：优先用同目录的 config_intel.yaml；想用模板请先复制为 config_intel.yaml
+rem Config: prefer config_intel.yaml next to this script; fall back
+rem to the bundled template when it is missing.
 if not exist "%~dp0config_intel.yaml" (
   if exist "%~dp0config.addon.example.yaml" (
-    echo [提示] 未找到 config_intel.yaml，正在从模板生成...
+    echo [info] config_intel.yaml not found - generating from template...
     copy /y "%~dp0config.addon.example.yaml" "%~dp0config_intel.yaml" >nul
   )
 )
 
-rem 用后端自带的运行时（IPEX/XPU 全在这里），不动后端文件
+rem Use the runtime bundled with the backend (IPEX/XPU all inside)
 set "PY=%BSAI_BACKEND_DIR%\runtime\python.exe"
 if not exist "%PY%" (
-  echo [错误] 找不到后端运行时：%PY%
-  echo         请把本目录整个解压到 GPT-SoVITS-For-Intel 根目录再运行。
+  echo [ERROR] backend runtime not found: %PY%
+  echo         Extract this folder next to the GPT-SoVITS-For-Intel root first.
   pause
   exit /b 1
 )
@@ -32,14 +35,18 @@ set "PATH=%BSAI_BACKEND_DIR%\runtime\Library\bin;%BSAI_BACKEND_DIR%\runtime\Lib\
 set "PYTHONMALLOC=malloc"
 set "OMP_NUM_THREADS=2"
 set "MKL_NUM_THREADS=2"
+rem Loopback addresses must bypass any system HTTP proxy, or /api/servers
+rem probing would falsely report the 9891 pool as offline.
+set "NO_PROXY=127.0.0.1,localhost,::1"
+set "no_proxy=127.0.0.1,localhost,::1"
 
 echo =============================================
-echo   AIReader TTS 附加包  -  原后端零改动
-echo   后端目录: %BSAI_BACKEND_DIR%
+echo   AIReader TTS addon
+echo   Backend dir: %BSAI_BACKEND_DIR%
 echo =============================================
 
 "%PY%" "%~dp0server_intel.py"
 
 echo.
-echo 附加包已停止。
+echo Addon stopped.
 pause
