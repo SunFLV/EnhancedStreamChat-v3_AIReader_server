@@ -929,24 +929,25 @@ def _split_sentences(text):
     SHORT_CORE = 6  # post-clean speakable core ≤ this must not stand alone
 
     def _too_short(s):
-        # 纯英文短句（如 "Shields are up!"）不能并进后一句：v5turbo 对
-        # 15 字符以内的英文短句会 immediate-EOS → 0.24s 静音；合并后静音
-        # 混在长句音频里，整句静音检测抓不到，表现就是开头几个词消失。
-        # 让它独立成句，_synth_one 的 padding 兜底（重复一遍→1.6s 有声）接住。
-        # 中文短句仍按原逻辑合并（中文短句本身能正常合成）。
-        if _pick_lang(s, 'zh') == 'en':
-            return False
         return _core_speak_len(s) <= SHORT_CORE
 
     def _glue(a, b):
         """拼接短句碎片；字母/数字边界补空格，避免 `up!We` 这种粘连。
 
-        GPT-SoVITS 的英文前端遇到 `!W` 这种「标点紧跟字母」会把前一段吞掉
-        （实测 “Shields are up!We apologize…” 只读出后半句）。中文标点后不
-        需要空格，所以只在两侧都是 ASCII 可见字符且右侧是字母/数字时补。
+        英文短句 + 后句要转成自然英文连接：v5turbo 对独立英文短句（<15 字符）
+        immediate-EOS 吐静音，即使重复也一样；而 `Shields are up! We...`
+        这种感叹号紧跟仍会吞开头，只有改成 `Shields are up, and we...`
+        才能让模型完整读出（本地 whisper 实测确认）。中文标点后不需要空格，
+        所以只在两侧都是 ASCII 可见字符且右侧是字母/数字时处理。
         """
         if (a and b and 0x21 <= ord(a[-1]) <= 0x7E
                 and 0x21 <= ord(b[0]) <= 0x7E and b[0].isalnum()):
+            if _pick_lang(a, 'zh') == 'en' and _pick_lang(b, 'zh') == 'en':
+                # 英文短句以 ! / . 结尾 → 改成 ", and " 连到后句（后句首字母转小写）
+                stripped = a.rstrip('!?. ')
+                if stripped and len(a) - len(stripped) <= 3:
+                    tail = b[0].lower() + b[1:] if b[0].isupper() else b
+                    return stripped + ", and " + tail
             return a + " " + b
         return a + b
 
