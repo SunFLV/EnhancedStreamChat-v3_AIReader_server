@@ -9,6 +9,7 @@ loads nothing and two backends are never resident at once.
 
 import io
 import os
+import re
 import time
 import json
 import base64
@@ -885,10 +886,18 @@ def _core_speak_len(s):
     return cjk + (latin + 2) // 3   # ceil(latin/3): ~0.1 s per latin char
 
 
+# 英文缩写：英文句号切句时这些词后面的点不是句末，切完要粘回前一段。
+_EN_ABBR = re.compile(
+    r'^(?:Dr|Mr|Mrs|Ms|Prof|Sr|Jr|St|vs|etc|No|Fig|Inc|Ltd|Co|'
+    r'e\.g|i\.e|p\.m|a\.m|U\.S|U\.K|approx|dept|est|min|max)$', re.I)
+
+
 def _split_sentences(text):
     """Split long text into speakable sentences.
     - Normalizes CRLF/CR to LF (Windows pastes)
     - Splits on sentence terminators AND newlines (paragraph breaks)
+    - English periods split too (`. ` + Capital/quote), with abbreviations
+      (Dr. / p.m. / U.S. / e.g.) re-joined so `Dr. Smith` stays one sentence
     - Merges isolated short fragments (closing quotes like 」”）) back
       into a neighbouring sentence, so `“xxx。”` isn't torn apart into
       `“xxx。` + `”` (the bare quote would be cleaned to empty & skipped).
@@ -922,14 +931,27 @@ def _split_sentences(text):
             text = text[:_em.start()]
             _end_read = True
 
-    # Split keeping the terminator attached to its sentence
-    parts = re.split(r'(?<=[。！？!?；;\n])', text)
-    sents = [p.strip() for p in parts if p.strip()]
+    # Split keeping the terminator attached to its sentence.
+    # 英文句号也要切，但只在「. + 空格 + 大写/引号」处切 —— 避开小数点
+    # ($5.50) 和省略号 (wait...)。缩写（Dr. / p.m. / U.S. / e.g.）会被切开，
+    # 下一步把这类碎片粘回前一段。
+    parts = re.split(r'(?<=[。！？!?；;\n])|(?<=\.)\s+(?=[A-Z"“])', text)
+    raw = [p.strip() for p in parts if p.strip()]
+    sents = []
+    for p in raw:
+        if sents and _EN_ABBR.match(sents[-1].rstrip('.')):
+            sents[-1] = sents[-1] + ' ' + p
+        else:
+            sents.append(p)
 
     SHORT_CORE = 6  # post-clean speakable core ≤ this must not stand alone
 
     def _too_short(s):
-        return _core_speak_len(s) <= SHORT_CORE
+        # 英文的静音临界比中文低：实测 core=6 的 "Wait... what happened?"
+        # / "I cannot believe this." 单独合成正常（rms 0.1），core=5 的
+        # "Are you serious?" 才静音；中文短句仍是 ≤6 才安全。所以英文用 5。
+        limit = 5 if _pick_lang(s, 'zh') == 'en' else SHORT_CORE
+        return _core_speak_len(s) <= limit
 
     def _glue(a, b):
         """拼接短句碎片；字母/数字边界补空格，避免 `up!We` 这种粘连。
@@ -943,11 +965,14 @@ def _split_sentences(text):
         if (a and b and 0x21 <= ord(a[-1]) <= 0x7E
                 and 0x21 <= ord(b[0]) <= 0x7E and b[0].isalnum()):
             if _pick_lang(a, 'zh') == 'en' and _pick_lang(b, 'zh') == 'en':
-                # 英文短句以 ! / . 结尾 → 改成 ", and " 连到后句（后句首字母转小写）
-                stripped = a.rstrip('!?. ')
-                if stripped and len(a) - len(stripped) <= 3:
-                    tail = b[0].lower() + b[1:] if b[0].isupper() else b
-                    return stripped + ", and " + tail
+                # 只对感叹句做连接（"Shields are up!" → "Shields are up, and …"）。
+                # 问句（?）绝不能改成 ", and" —— 会把 "what happened?" 变成
+                # 陈述句且把 I 降成 i，语义全错。句号结尾的短句保持原样拼接。
+                if a.rstrip().endswith('!'):
+                    stripped = a.rstrip('! ')
+                    if stripped:
+                        tail = b[0].lower() + b[1:] if b[:1].isupper() else b
+                        return stripped + ", and " + tail
             return a + " " + b
         return a + b
 
